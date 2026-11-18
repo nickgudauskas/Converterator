@@ -576,6 +576,7 @@ struct ContentView: View {
     @ObservedObject private var updater = UpdateChecker.shared
     @State private var dropTargeted = false
     @State private var showLog = false
+    @State private var confirmCancel = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -622,6 +623,17 @@ struct ContentView: View {
             bottomBar.padding(.horizontal, 14).padding(.vertical, 10)
         }
         .frame(minWidth: 560, minHeight: 420)
+        .alert("Stop converting?", isPresented: $confirmCancel) {
+            Button("Stop Converting", role: .destructive) {
+                if c.isRunning { c.cancel() }   // the batch may have finished while the dialog was open
+            }
+            Button("Keep Converting", role: .cancel) {}
+        } message: {
+            Text(cancelMessage)
+        }
+        .onChange(of: c.isRunning) { _, running in
+            if !running { confirmCancel = false }   // nothing left to cancel
+        }
         .onChange(of: c.batchProgress) { _, p in
             // Percentage on the Dock icon while a batch runs.
             NSApp.dockTile.badgeLabel = c.isRunning ? "\(Int(p * 100))%" : nil
@@ -629,6 +641,20 @@ struct ContentView: View {
         .onChange(of: c.isRunning) { _, running in
             if !running { NSApp.dockTile.badgeLabel = nil }
         }
+    }
+
+    /// Explains what Stop Converting does to the current file and the rest of the queue.
+    private var cancelMessage: String {
+        var lines: [String] = []
+        if let current = c.jobs.first(where: { $0.state == .working }) {
+            lines.append("“\(current.url.lastPathComponent)” will be stopped, and its unfinished CHD deleted. Your original files aren't touched.")
+        }
+        let waiting = c.batchQueuedCount
+        if waiting > 0 {
+            lines.append("\(waiting) file\(waiting == 1 ? "" : "s") not started yet will stay in the list, so you can convert \(waiting == 1 ? "it" : "them") later.")
+        }
+        lines.append("CHDs already finished in this batch are kept.")
+        return lines.joined(separator: "\n\n")
     }
 
     /// Overall progress for the whole Convert run, then a summary once it finishes.
@@ -789,7 +815,7 @@ struct ContentView: View {
             .font(.caption)
                 .padding(.trailing, 6)
             if c.isRunning {
-                Button("Cancel", role: .cancel, action: c.cancel)
+                Button("Cancel", role: .cancel) { confirmCancel = true }
             } else {
                 Button("Convert", action: c.start)
                     .keyboardShortcut(.defaultAction)
