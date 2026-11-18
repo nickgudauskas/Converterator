@@ -1,5 +1,7 @@
 #!/bin/zsh
 # Builds "Converterator.app" next to this script.
+# Ad-hoc signed by default. Set SIGN_IDENTITY (e.g. "Developer ID Application") to sign for
+# distribution; notarize.sh does that for you.
 set -euo pipefail
 cd "${0:A:h}"
 
@@ -79,6 +81,17 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP"
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  # Developer ID signing for notarization: hardened runtime + secure timestamp on every executable.
+  # PSXPackager is a .NET app, which needs JIT and unsigned executable memory under hardened runtime.
+  for bin in "$PSX"/psxpackager-*; do
+    codesign --force --timestamp --options runtime \
+      --entitlements psxpackager.entitlements --sign "$SIGN_IDENTITY" "$bin"
+  done
+  codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP"
+  echo "Signed with: $SIGN_IDENTITY"
+else
+  codesign --force --sign - "$APP"   # ad-hoc: fine for your own Mac, not for distribution
+fi
 rm -rf build
 echo "Built $APP"
