@@ -22,7 +22,7 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 
 ## Features
 
-- **Batch conversion.** Add any number of files or folders. Folders are searched recursively, and everything is converted one file at a time, with a status and progress bar for each. An overall bar shows progress through the whole batch ("Converting file 3 of 10"), the Dock icon shows the batch percentage, and a summary of converted, failed and not-started files stays up when the batch ends.
+- **Batch conversion.** Add any number of files or folders. Folders are searched recursively, and everything is converted one file at a time, with a status and progress bar for each. An overall bar shows progress through the whole batch ("Converting file 3 of 10") with an estimate of the time left, and the Dock icon shows the batch percentage. When the batch ends, a summary of converted, failed and not-started files and the total time taken stays up. Progress is weighted by file size, so big discs count for more than small ones, and CHDs that already exist don't throw off the estimate.
 - **Drag and drop.** Drop files on the window or on the Dock icon, or use **Open With → Converterator** in Finder. The app never makes itself the default for these file types.
 - **Multi-disc PBPs.** Each disc becomes its own `.chd`. An `.m3u` playlist is written so emulators can swap discs (this can be turned off).
 - **Output location.** CHDs are saved next to each source file by default, or all in one folder you choose with **Save CHDs to:**.

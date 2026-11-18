@@ -14,6 +14,11 @@ struct Job: Identifiable {
     var progress: Double? = nil
     /// How much of this whole job is done (0…1), across extraction and every disc. Feeds the batch bar.
     var fraction: Double = 0
+    /// Total size in bytes of this job's input files; bigger files count for more of the batch.
+    var weight: Double = 1
+    /// False when the job finished without real work (every CHD already existed, or it failed),
+    /// so it doesn't skew the time-remaining estimate.
+    var timed: Bool = true
 }
 
 /// Splits a byte stream into lines on \n or \r (chdman uses \r for its progress counter).
@@ -153,7 +158,14 @@ final class Converter: ObservableObject {
         let new = found.map { $0.standardizedFileURL }
             .filter { !existing.contains($0) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-        let newJobs = new.map { Job(url: $0) }
+        let newJobs = new.map { url -> Job in
+            var job = Job(url: url)
+            let bytes = Converter.sourceFiles(for: url).reduce(0.0) { sum, f in
+                sum + Double(((try? fm.attributesOfItem(atPath: f.path)[.size]) as? NSNumber)?.int64Value ?? 0)
+            }
+            job.weight = max(bytes, 1)
+            return job
+        }
         jobs += newJobs
         if isRunning { batchIDs += newJobs.map(\.id) }   // files added mid-run join the current batch
         if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi or .iso files found in what was added.") }
@@ -179,17 +191,56 @@ final class Converter: ObservableObject {
         let ids = Set(batchIDs)
         return jobs.filter { ids.contains($0.id) }
     }
+    /// How far through a job is, 0…1.
+    private static func done(_ j: Job) -> Double {
+        switch j.state {
+        case .done, .failed: return 1
+        case .working: return min(max(j.fraction, 0), 1)
+        case .queued: return 0
+        }
+    }
+    /// Batch progress weighted by file size, so a 700 MB disc counts more than a 50 MB one.
     var batchProgress: Double {
         let b = batchJobs
-        guard !b.isEmpty else { return 0 }
-        let sum = b.reduce(0.0) { acc, j in
-            switch j.state {
-            case .done, .failed: return acc + 1
-            case .working: return acc + min(max(j.fraction, 0), 1)
-            case .queued: return acc
-            }
-        }
-        return sum / Double(b.count)
+        let total = b.reduce(0.0) { $0 + $1.weight }
+        guard total > 0 else { return 0 }
+        return b.reduce(0.0) { $0 + $1.weight * Converter.done($1) } / total
+    }
+
+    @Published private(set) var batchStart: Date?
+    @Published private(set) var batchEnd: Date?
+
+    /// Seconds left in the batch, from the average speed so far. Nil until there's enough to go on.
+    func batchTimeRemaining(now: Date = Date()) -> TimeInterval? {
+        guard isRunning, let start = batchStart else { return nil }
+        let b = batchJobs
+        let worked = b.filter(\.timed).reduce(0.0) { $0 + $1.weight * Converter.done($1) }
+        let left = b.reduce(0.0) { $0 + $1.weight * (1 - Converter.done($1)) }
+        return Converter.estimateRemaining(elapsed: now.timeIntervalSince(start), worked: worked, left: left)
+    }
+
+    /// Remaining time = bytes left ÷ (bytes processed ÷ time so far). Waits for 10 s and some progress.
+    nonisolated static func estimateRemaining(elapsed: TimeInterval, worked: Double, left: Double) -> TimeInterval? {
+        guard elapsed >= 10, worked > 0 else { return nil }
+        if left <= 0 { return 0 }
+        return left / (worked / elapsed)
+    }
+
+    /// "About 12 minutes left", "About 1 hour, 5 minutes left", "Less than a minute left".
+    nonisolated static func describeRemaining(_ seconds: TimeInterval) -> String {
+        if seconds < 60 { return "Less than a minute left" }
+        return "About \(describeDuration(seconds)) left"
+    }
+
+    nonisolated static func describeDuration(_ seconds: TimeInterval) -> String {
+        if seconds < 60 { return "\(max(Int(seconds.rounded()), 1)) second\(Int(seconds.rounded()) == 1 ? "" : "s")" }
+        // Round to the nearest minute so the estimate doesn't flicker every second.
+        let rounded = (seconds / 60).rounded() * 60
+        let f = DateComponentsFormatter()
+        f.unitsStyle = .full
+        f.allowedUnits = rounded >= 3600 ? [.hour, .minute] : [.minute]
+        f.maximumUnitCount = 2
+        return f.string(from: rounded) ?? ""
     }
     var batchDoneCount: Int { batchJobs.filter { $0.state == .done }.count }
     var batchFailedCount: Int { batchJobs.filter { $0.state == .failed }.count }
@@ -212,10 +263,13 @@ final class Converter: ObservableObject {
         isRunning = true
         cancelRequested = false
         batchIDs = jobs.filter { $0.state == .queued }.map(\.id)
+        batchStart = Date()
+        batchEnd = nil
         Task {
             while !cancelRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
                 await convert(index: i)
             }
+            batchEnd = Date()
             isRunning = false
             append(cancelRequested ? "— Cancelled —" : "— All done —")
         }
@@ -235,12 +289,12 @@ final class Converter: ObservableObject {
         let tmp = fm.temporaryDirectory.appendingPathComponent("pbp2chd-\(UUID().uuidString)", isDirectory: true)
 
         func fail(_ msg: String) {
-            update(id) { $0.state = .failed; $0.detail = msg; $0.progress = nil }
+            update(id) { $0.state = .failed; $0.detail = msg; $0.progress = nil; $0.timed = false }
             append("✗ \(src.lastPathComponent): \(msg)")
         }
 
         let isPBP = src.pathExtension.lowercased() == "pbp"
-        update(id) { $0.state = .working; $0.detail = isPBP ? "Extracting BIN/CUE…" : "Starting…"; $0.progress = nil; $0.fraction = 0 }
+        update(id) { $0.state = .working; $0.detail = isPBP ? "Extracting BIN/CUE…" : "Starting…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
         // For the batch bar, PBP extraction counts as the first 20% of the job, compression the rest.
         let compressStart = isPBP ? 0.2 : 0.0
         append("▶ \(src.lastPathComponent)")
@@ -273,6 +327,7 @@ final class Converter: ObservableObject {
         // Step 2: BIN/CUE → CHD, one per disc
         var made: [URL] = []
         var allNewlyCreated = true   // false if any CHD was skipped because it already existed
+        var skippedCount = 0
         for (n, cue) in cues.enumerated() {
             let name = cues.count == 1 ? base : cue.deletingPathExtension().lastPathComponent
             let out = outDir.appendingPathComponent(name + ".chd")
@@ -282,6 +337,7 @@ final class Converter: ObservableObject {
                 append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
                 made.append(out)
                 allNewlyCreated = false
+                skippedCount += 1
                 update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1) }
                 continue
             }
@@ -338,7 +394,9 @@ final class Converter: ObservableObject {
             }
         }
 
-        update(id) { $0.state = .done; $0.detail = summary; $0.progress = nil }
+        // If every CHD already existed, this job took no real time: keep it out of the speed estimate.
+        let didWork = made.count > 0 && !(made.count == skippedCount)
+        update(id) { $0.state = .done; $0.detail = summary; $0.progress = nil; $0.timed = didWork }
         append("✓ \(summary)")
     }
 
@@ -575,17 +633,29 @@ struct ContentView: View {
 
     /// Overall progress for the whole Convert run, then a summary once it finishes.
     private var batchBar: some View {
+        // Ticks every second so the estimate keeps moving even while a file reports no progress.
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            batchBarContent(now: timeline.date)
+        }
+    }
+
+    private func batchBarContent(now: Date) -> some View {
         let total = c.batchJobs.count
         let finished = c.batchDoneCount + c.batchFailedCount
         let pct = Int(c.batchProgress * 100)
         let status: String
+        var timeText = ""
         if c.isRunning {
             status = "Converting file \(min(finished + 1, total)) of \(total)"
+            timeText = c.batchTimeRemaining(now: now).map(Converter.describeRemaining) ?? "Estimating time left…"
         } else {
             var parts = ["\(c.batchDoneCount) converted"]
             if c.batchFailedCount > 0 { parts.append("\(c.batchFailedCount) failed") }
             if c.batchQueuedCount > 0 { parts.append("\(c.batchQueuedCount) not started") }
             status = "Batch finished: " + parts.joined(separator: ", ")
+            if let s = c.batchStart, let e = c.batchEnd {
+                timeText = "Took " + Converter.describeDuration(e.timeIntervalSince(s))
+            }
         }
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -597,6 +667,12 @@ struct ContentView: View {
             .foregroundStyle(c.isRunning ? .primary : .secondary)
             ProgressView(value: c.batchProgress)
                 .tint(!c.isRunning && c.batchFailedCount > 0 ? .orange : .accentColor)
+            if !timeText.isEmpty {
+                Text(timeText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
         }
     }
 
