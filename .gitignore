@@ -1,0 +1,9 @@
+# Build output
+Converterator.app/
+build/
+AppIcon.iconset/
+
+# Downloaded by build.sh
+vendor/
+
+.DS_Store
