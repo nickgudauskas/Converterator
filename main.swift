@@ -378,10 +378,102 @@ final class Converter: ObservableObject {
     }
 }
 
+// MARK: - Updates
+
+/// Checks the GitHub "latest release" for a newer version and offers to open its download page.
+@MainActor
+final class UpdateChecker: ObservableObject {
+    static let shared = UpdateChecker()
+    static let repo = "nickgudauskas/Converterator"
+
+    @Published var isChecking = false
+
+    var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    /// True when version `a` is newer than `b`, comparing numerically ("1.10" > "1.9"). A leading "v" is ignored.
+    nonisolated static func isNewer(_ a: String, than b: String) -> Bool {
+        func parts(_ s: String) -> [Int] {
+            s.trimmingCharacters(in: .whitespaces)
+                .drop(while: { $0 == "v" || $0 == "V" })
+                .split(separator: ".")
+                .map { Int($0.prefix(while: \.isNumber)) ?? 0 }
+        }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    private struct Release: Decodable {
+        let tag_name: String
+        let html_url: String
+    }
+
+    func check() {
+        guard !isChecking else { return }
+        isChecking = true
+        Task {
+            defer { isChecking = false }
+            do {
+                var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!)
+                req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+                req.timeoutInterval = 15
+                let (data, response) = try await URLSession.shared.data(for: req)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                let release = try JSONDecoder().decode(Release.self, from: data)
+                let latest = String(release.tag_name.drop(while: { $0 == "v" || $0 == "V" }))
+
+                if Self.isNewer(latest, than: currentVersion) {
+                    // Only ever open this repo's own release page.
+                    let page = URL(string: release.html_url)
+                        .filter { $0.absoluteString.hasPrefix("https://github.com/\(Self.repo)/") }
+                        ?? URL(string: "https://github.com/\(Self.repo)/releases/latest")!
+                    show(title: "Converterator \(latest) is available",
+                         message: "You have version \(currentVersion). Download the new version from GitHub, then replace the app in your Applications folder.",
+                         primary: "Download", secondary: "Later") { NSWorkspace.shared.open(page) }
+                } else {
+                    show(title: "You're up to date",
+                         message: "Converterator \(currentVersion) is the latest version.", primary: "OK")
+                }
+            } catch {
+                show(title: "Couldn't check for updates",
+                     message: "GitHub couldn't be reached. Check your internet connection and try again.\n\n(\(error.localizedDescription))",
+                     primary: "OK")
+            }
+        }
+    }
+
+    private func show(title: String, message: String, primary: String, secondary: String? = nil,
+                      onPrimary: (() -> Void)? = nil) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: primary)
+        if let secondary { alert.addButton(withTitle: secondary) }
+        let handle: (NSApplication.ModalResponse) -> Void = { if $0 == .alertFirstButtonReturn { onPrimary?() } }
+        // Attach to the window as a sheet so it can't get lost behind other windows.
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) {
+            alert.beginSheetModal(for: window, completionHandler: handle)
+        } else {
+            handle(alert.runModal())
+        }
+    }
+}
+
+extension Optional {
+    /// Keeps the value only if it passes `test`.
+    func filter(_ test: (Wrapped) -> Bool) -> Wrapped? { flatMap { test($0) ? $0 : nil } }
+}
+
 // MARK: - UI
 
 struct ContentView: View {
     @ObservedObject private var c = Converter.shared
+    @ObservedObject private var updater = UpdateChecker.shared
     @State private var dropTargeted = false
     @State private var showLog = false
 
@@ -528,10 +620,18 @@ struct ContentView: View {
             .disabled(c.isRunning || c.jobs.isEmpty)
             Toggle("Show Log", isOn: $showLog).toggleStyle(.button)
             Spacer()
-            Text(Self.versionLabel)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .textSelection(.enabled)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(Self.versionLabel)
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                if updater.isChecking {
+                    Text("Checking…").foregroundStyle(.secondary)
+                } else {
+                    Button("Check for Updates") { updater.check() }
+                        .buttonStyle(.link)
+                }
+            }
+            .font(.caption)
                 .padding(.trailing, 6)
             if c.isRunning {
                 Button("Cancel", role: .cancel, action: c.cancel)
@@ -587,5 +687,10 @@ struct ConverteratorApp: App {
     var body: some Scene {
         Window("Converterator", id: "main") { ContentView() }
             .defaultSize(width: 640, height: 520)
+            .commands {
+                CommandGroup(after: .appInfo) {
+                    Button("Check for Updates…") { UpdateChecker.shared.check() }
+                }
+            }
     }
 }

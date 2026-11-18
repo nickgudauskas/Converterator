@@ -27,6 +27,7 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 - **Optional cleanup.** Turn on **Move source files to Trash after a successful conversion** to clear out the originals. That's the `.pbp`, `.cue`, `.gdi` or `.iso`, plus any `.bin` or track files a `.cue` or `.gdi` lists. Files go to the Trash, so they can be restored, and only after every CHD for that game was newly written. If a CHD already existed and was skipped, the originals stay. The option turns itself off each time the app starts.
 - **Cancel and retry.** **Cancel** stops after cleaning up the current file. **Clear → Retry Failed** re-queues only the failures.
 - **Log.** **Show Log** displays the full output from PSXPackager and `chdman` for troubleshooting.
+- **Check for updates.** Click **Check for Updates** under the version number, or choose **Converterator → Check for Updates…**. The app asks GitHub for the latest release and, if it's newer, offers to open the download page. It only checks when you ask and sends nothing about you.
 - Your output folder and option settings are remembered between launches.
 
 ## Download
