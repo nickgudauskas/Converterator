@@ -12,6 +12,8 @@ struct Job: Identifiable {
     var state: State = .queued
     var detail: String = "Waiting"
     var progress: Double? = nil
+    /// How much of this whole job is done (0…1), across extraction and every disc. Feeds the batch bar.
+    var fraction: Double = 0
 }
 
 /// Splits a byte stream into lines on \n or \r (chdman uses \r for its progress counter).
@@ -151,7 +153,9 @@ final class Converter: ObservableObject {
         let new = found.map { $0.standardizedFileURL }
             .filter { !existing.contains($0) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-        jobs += new.map { Job(url: $0) }
+        let newJobs = new.map { Job(url: $0) }
+        jobs += newJobs
+        if isRunning { batchIDs += newJobs.map(\.id) }   // files added mid-run join the current batch
         if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi or .iso files found in what was added.") }
     }
 
@@ -162,9 +166,34 @@ final class Converter: ObservableObject {
     }
     func retryFailed() {
         for i in jobs.indices where jobs[i].state == .failed {
-            jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil
+            jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil; jobs[i].fraction = 0
         }
     }
+
+    // MARK: Batch progress
+
+    /// The jobs in the current (or most recent) Convert run.
+    @Published private(set) var batchIDs: [UUID] = []
+
+    var batchJobs: [Job] {
+        let ids = Set(batchIDs)
+        return jobs.filter { ids.contains($0.id) }
+    }
+    var batchProgress: Double {
+        let b = batchJobs
+        guard !b.isEmpty else { return 0 }
+        let sum = b.reduce(0.0) { acc, j in
+            switch j.state {
+            case .done, .failed: return acc + 1
+            case .working: return acc + min(max(j.fraction, 0), 1)
+            case .queued: return acc
+            }
+        }
+        return sum / Double(b.count)
+    }
+    var batchDoneCount: Int { batchJobs.filter { $0.state == .done }.count }
+    var batchFailedCount: Int { batchJobs.filter { $0.state == .failed }.count }
+    var batchQueuedCount: Int { batchJobs.filter { $0.state == .queued }.count }
 
     func append(_ s: String) {
         log += s + "\n"
@@ -182,6 +211,7 @@ final class Converter: ObservableObject {
         guard !isRunning, toolsReady else { return }
         isRunning = true
         cancelRequested = false
+        batchIDs = jobs.filter { $0.state == .queued }.map(\.id)
         Task {
             while !cancelRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
                 await convert(index: i)
@@ -210,7 +240,9 @@ final class Converter: ObservableObject {
         }
 
         let isPBP = src.pathExtension.lowercased() == "pbp"
-        update(id) { $0.state = .working; $0.detail = isPBP ? "Extracting BIN/CUE…" : "Starting…"; $0.progress = nil }
+        update(id) { $0.state = .working; $0.detail = isPBP ? "Extracting BIN/CUE…" : "Starting…"; $0.progress = nil; $0.fraction = 0 }
+        // For the batch bar, PBP extraction counts as the first 20% of the job, compression the rest.
+        let compressStart = isPBP ? 0.2 : 0.0
         append("▶ \(src.lastPathComponent)")
 
         do {
@@ -231,6 +263,11 @@ final class Converter: ObservableObject {
                 .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             guard s1 == 0 || !cues.isEmpty else { return fail("PSXPackager failed (exit \(s1)) — see log") }
             guard !cues.isEmpty else { return fail("PSXPackager produced no .cue file — see log") }
+            update(id) { $0.fraction = compressStart }
+        }
+        let discCount = Double(cues.count)
+        func jobFraction(disc n: Int, discProgress p: Double) -> Double {
+            compressStart + (1 - compressStart) * (Double(n) + p) / discCount
         }
 
         // Step 2: BIN/CUE → CHD, one per disc
@@ -245,6 +282,7 @@ final class Converter: ObservableObject {
                 append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
                 made.append(out)
                 allNewlyCreated = false
+                update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1) }
                 continue
             }
             update(id) { $0.detail = label + "…"; $0.progress = 0 }
@@ -254,7 +292,11 @@ final class Converter: ObservableObject {
             let s2 = await run(chdman!, args) { [weak self] line in
                 if let r = line.range(of: #"([0-9.]+)% complete"#, options: .regularExpression) {
                     let pct = Double(line[r].split(separator: "%")[0]) ?? 0
-                    self?.update(id) { $0.progress = pct / 100; $0.detail = "\(label) — \(Int(pct))%" }
+                    self?.update(id) {
+                        $0.progress = pct / 100
+                        $0.fraction = jobFraction(disc: n, discProgress: pct / 100)
+                        $0.detail = "\(label) — \(Int(pct))%"
+                    }
                 } else {
                     self?.append("  [chdman] \(line)")
                 }
@@ -516,9 +558,46 @@ struct ContentView: View {
             }
 
             Divider()
+            if !c.batchJobs.isEmpty {
+                batchBar.padding(.horizontal, 14).padding(.top, 10)
+            }
             bottomBar.padding(.horizontal, 14).padding(.vertical, 10)
         }
         .frame(minWidth: 560, minHeight: 420)
+        .onChange(of: c.batchProgress) { _, p in
+            // Percentage on the Dock icon while a batch runs.
+            NSApp.dockTile.badgeLabel = c.isRunning ? "\(Int(p * 100))%" : nil
+        }
+        .onChange(of: c.isRunning) { _, running in
+            if !running { NSApp.dockTile.badgeLabel = nil }
+        }
+    }
+
+    /// Overall progress for the whole Convert run, then a summary once it finishes.
+    private var batchBar: some View {
+        let total = c.batchJobs.count
+        let finished = c.batchDoneCount + c.batchFailedCount
+        let pct = Int(c.batchProgress * 100)
+        let status: String
+        if c.isRunning {
+            status = "Converting file \(min(finished + 1, total)) of \(total)"
+        } else {
+            var parts = ["\(c.batchDoneCount) converted"]
+            if c.batchFailedCount > 0 { parts.append("\(c.batchFailedCount) failed") }
+            if c.batchQueuedCount > 0 { parts.append("\(c.batchQueuedCount) not started") }
+            status = "Batch finished: " + parts.joined(separator: ", ")
+        }
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(status)
+                Spacer()
+                Text("\(pct)%").monospacedDigit()
+            }
+            .font(.callout)
+            .foregroundStyle(c.isRunning ? .primary : .secondary)
+            ProgressView(value: c.batchProgress)
+                .tint(!c.isRunning && c.batchFailedCount > 0 ? .orange : .accentColor)
+        }
     }
 
     private var missingToolsBanner: some View {
