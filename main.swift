@@ -2,6 +2,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import UserNotifications
 
 // MARK: - Model
 
@@ -19,6 +20,37 @@ struct Job: Identifiable {
     /// False when the job finished without real work (every CHD already existed, or it failed),
     /// so it doesn't skew the time-remaining estimate.
     var timed: Bool = true
+    /// Bytes in and out for CHDs this job newly wrote, for "saved 1.2 GB". Zero when nothing was written.
+    var bytesIn: Double = 0
+    var bytesOut: Double = 0
+
+    /// A .chd input is extracted back to BIN/CUE (or GDI/ISO) instead of being compressed.
+    var isExtraction: Bool { url.pathExtension.lowercased() == "chd" }
+}
+
+/// "1.2 GB", "712 MB".
+func formatBytes(_ b: Double) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .file)
+}
+
+/// Total size of the files at these URLs (missing files count as 0).
+func totalSize(_ urls: [URL]) -> Double {
+    urls.reduce(0.0) { sum, f in
+        sum + Double(((try? FileManager.default.attributesOfItem(atPath: f.path)[.size]) as? NSNumber)?.int64Value ?? 0)
+    }
+}
+
+/// How chdman should treat .iso files.
+enum ISOMode: String, CaseIterable, Identifiable {
+    case automatic, cd, dvd
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .cd: return "Always CD"
+        case .dvd: return "Always DVD"
+        }
+    }
 }
 
 /// Splits a byte stream into lines on \n or \r (chdman uses \r for its progress counter).
@@ -64,10 +96,30 @@ final class Converter: ObservableObject {
         didSet { UserDefaults.standard.set(makeM3U, forKey: "makeM3U") }
     }
 
-    let psxpackager: URL? = Converter.findTool("psxpackager")
-    let chdman: URL? = Converter.findTool("chdman")
+    @Published var verify: Bool {
+        didSet { UserDefaults.standard.set(verify, forKey: "verify") }
+    }
+    @Published var isoMode: ISOMode {
+        didSet { UserDefaults.standard.set(isoMode.rawValue, forKey: "isoMode") }
+    }
+
+    @Published private(set) var psxpackager: URL? = Converter.findTool("psxpackager")
+    @Published private(set) var chdman: URL? = Converter.findTool("chdman")
+
+    /// Looks for the tools again, e.g. after chdman was installed while the app was open.
+    func recheckTools() {
+        let p = Converter.findTool("psxpackager"), c = Converter.findTool("chdman")
+        if p != psxpackager { psxpackager = p }
+        if c != chdman { chdman = c }
+    }
+
+    static var homebrewInstalled: Bool {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].contains { FileManager.default.isExecutableFile(atPath: $0) }
+    }
 
     private var currentProcess: Process?
+    /// Keeps the Mac from idle-sleeping while a batch runs.
+    private var activity: NSObjectProtocol?
     /// Move source files to the Trash after a successful conversion.
     /// Deliberately not remembered between launches, so it's never on by surprise.
     @Published var trashSources = false
@@ -81,9 +133,12 @@ final class Converter: ObservableObject {
         }
         overwrite = d.bool(forKey: "overwrite")
         makeM3U = d.object(forKey: "makeM3U") as? Bool ?? true
+        verify = d.bool(forKey: "verify")
+        isoMode = ISOMode(rawValue: d.string(forKey: "isoMode") ?? "") ?? .automatic
     }
 
-    var toolsReady: Bool { psxpackager != nil && chdman != nil }
+    /// chdman is needed for everything; PSXPackager only for .pbp files (checked per job).
+    var toolsReady: Bool { chdman != nil }
     var hasQueued: Bool { jobs.contains { $0.state == .queued } }
 
     // MARK: Tools
@@ -114,26 +169,25 @@ final class Converter: ObservableObject {
     static let toolEnvironment: [String: String] = {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
-        for root in ["/opt/homebrew/opt/dotnet/libexec", "/usr/local/opt/dotnet/libexec", "/usr/local/share/dotnet"]
-        where FileManager.default.fileExists(atPath: root) {
-            env["DOTNET_ROOT"] = env["DOTNET_ROOT"] ?? root
-            break
-        }
+        // PSXPackager is a self-contained .NET app (the runtime is inside it); nothing to point it at.
         env["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
         return env
     }()
 
     // MARK: Queue
 
-    /// Inputs we accept. .pbp goes through PSXPackager first; the rest go straight to chdman.
+    /// Inputs found when scanning folders. .pbp goes through PSXPackager first; the rest go straight to chdman.
     static let inputExtensions: Set<String> = ["pbp", "cue", "gdi", "iso"]
+    /// .chd files are extracted back to BIN/CUE, GDI or ISO. Only when added one by one: a folder scan
+    /// never picks them up, so re-adding a converted folder doesn't unpack every CHD in it.
+    static let extractExtensions: Set<String> = ["chd"]
 
     func add(_ urls: [URL]) {
         let fm = FileManager.default
         var found: [URL] = []
         func consider(_ f: URL) {
             let ext = f.pathExtension.lowercased()
-            if Converter.inputExtensions.contains(ext) {
+            if Converter.inputExtensions.contains(ext) || Converter.extractExtensions.contains(ext) {
                 found.append(f)
             } else if ext == "bin" {
                 // A dropped .bin means its .cue sheet (same name); folder scans pick up the .cue directly.
@@ -160,15 +214,12 @@ final class Converter: ObservableObject {
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         let newJobs = new.map { url -> Job in
             var job = Job(url: url)
-            let bytes = Converter.sourceFiles(for: url).reduce(0.0) { sum, f in
-                sum + Double(((try? fm.attributesOfItem(atPath: f.path)[.size]) as? NSNumber)?.int64Value ?? 0)
-            }
-            job.weight = max(bytes, 1)
+            job.weight = max(totalSize(Converter.sourceFiles(for: url)), 1)
             return job
         }
         jobs += newJobs
         if isRunning { batchIDs += newJobs.map(\.id) }   // files added mid-run join the current batch
-        if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi or .iso files found in what was added.") }
+        if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso or .chd files found in what was added.") }
     }
 
     func clearFinished() { jobs.removeAll { $0.state == .done || $0.state == .failed } }
@@ -179,6 +230,7 @@ final class Converter: ObservableObject {
     func retryFailed() {
         for i in jobs.indices where jobs[i].state == .failed {
             jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil; jobs[i].fraction = 0
+            jobs[i].bytesIn = 0; jobs[i].bytesOut = 0
         }
     }
 
@@ -246,6 +298,22 @@ final class Converter: ObservableObject {
     var batchFailedCount: Int { batchJobs.filter { $0.state == .failed }.count }
     var batchQueuedCount: Int { batchJobs.filter { $0.state == .queued }.count }
 
+    /// "Saved 2.1 GB (48%)" across the CHDs this batch wrote, or nil if it saved nothing.
+    var batchSavedText: String? {
+        let b = batchJobs.filter { $0.bytesOut > 0 && !$0.isExtraction }
+        let input = b.reduce(0.0) { $0 + $1.bytesIn }, output = b.reduce(0.0) { $0 + $1.bytesOut }
+        guard input > output else { return nil }
+        return "Saved \(formatBytes(input - output)) (\(Int(((input - output) / input * 100).rounded()))%)"
+    }
+
+    /// "4 converted, 1 failed, 2 not started".
+    var batchCountsText: String {
+        var parts = ["\(batchDoneCount) converted"]
+        if batchFailedCount > 0 { parts.append("\(batchFailedCount) failed") }
+        if batchQueuedCount > 0 { parts.append("\(batchQueuedCount) not started") }
+        return parts.joined(separator: ", ")
+    }
+
     func append(_ s: String) {
         log += s + "\n"
         if log.count > 200_000 { log = String(log.suffix(150_000)) }
@@ -265,13 +333,21 @@ final class Converter: ObservableObject {
         batchIDs = jobs.filter { $0.state == .queued }.map(\.id)
         batchStart = Date()
         batchEnd = nil
+        // Stop the Mac from idle-sleeping mid-batch. The display can still sleep; closing a laptop lid still sleeps.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled], reason: "Converting disc images")
+        Notifier.requestPermission()
         Task {
             while !cancelRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
-                await convert(index: i)
+                if jobs[i].isExtraction { await extract(index: i) } else { await convert(index: i) }
             }
             batchEnd = Date()
             isRunning = false
+            if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
             append(cancelRequested ? "— Cancelled —" : "— All done —")
+            if !cancelRequested {
+                Notifier.batchFinished(counts: batchCountsText, saved: batchSavedText, failed: batchFailedCount > 0)
+            }
         }
     }
 
@@ -308,7 +384,8 @@ final class Converter: ObservableObject {
         // Step 1 (PBP only): PBP → BIN/CUE in a temp folder. CUE/GDI/ISO inputs go straight to chdman.
         var cues = [src]
         if isPBP {
-            let s1 = await run(psxpackager!, ["-i", src.path, "-o", tmp.path, "-x", "-v", "2"]) { [weak self] line in
+            guard let psxpackager else { return fail("PSXPackager is missing from the app, so .pbp files can't be converted") }
+            let s1 = await run(psxpackager, ["-i", src.path, "-o", tmp.path, "-x", "-v", "2"]) { [weak self] line in
                 self?.append("  [psxpackager] \(line)")
             }
             if cancelRequested { return fail("Cancelled") }
@@ -328,40 +405,65 @@ final class Converter: ObservableObject {
         var made: [URL] = []
         var allNewlyCreated = true   // false if any CHD was skipped because it already existed
         var skippedCount = 0
+        var bytesIn = 0.0, bytesOut = 0.0
+        // With Verify on, each disc's share of the job is 75% compressing, 25% verifying.
+        let verifyShare = verify ? 0.25 : 0.0
         for (n, cue) in cues.enumerated() {
             let name = cues.count == 1 ? base : cue.deletingPathExtension().lastPathComponent
             let out = outDir.appendingPathComponent(name + ".chd")
-            let label = cues.count == 1 ? "Compressing to CHD" : "Compressing disc \(n + 1) of \(cues.count)"
+            let disc = cues.count == 1 ? "" : " disc \(n + 1) of \(cues.count)"
+            var wroteThisDisc = false
 
             if fm.fileExists(atPath: out.path) && !overwrite {
                 append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
                 made.append(out)
                 allNewlyCreated = false
                 skippedCount += 1
-                update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1) }
-                continue
-            }
-            update(id) { $0.detail = label + "…"; $0.progress = 0 }
-
-            var args = ["createcd", "-i", cue.path, "-o", out.path]
-            if overwrite { args.append("-f") }
-            let s2 = await run(chdman!, args) { [weak self] line in
-                if let r = line.range(of: #"([0-9.]+)% complete"#, options: .regularExpression) {
-                    let pct = Double(line[r].split(separator: "%")[0]) ?? 0
-                    self?.update(id) {
-                        $0.progress = pct / 100
-                        $0.fraction = jobFraction(disc: n, discProgress: pct / 100)
-                        $0.detail = "\(label) — \(Int(pct))%"
+                update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1 - verifyShare) }
+            } else {
+                // .iso: CD or DVD. Everything else (.cue, .gdi, and PBP extractions) is a CD.
+                var command = "createcd"
+                if cue.pathExtension.lowercased() == "iso" {
+                    let dvd: Bool
+                    switch isoMode {
+                    case .cd: dvd = false
+                    case .dvd: dvd = true
+                    case .automatic:
+                        let (isDVD, why) = Converter.isoLooksLikeDVD(cue)
+                        dvd = isDVD
+                        append("  \(isDVD ? "DVD" : "CD") image: \(why)")
                     }
-                } else {
-                    self?.append("  [chdman] \(line)")
+                    if dvd { command = "createdvd" }
                 }
+                let label = "Compressing\(disc) to CHD"
+                var args = [command, "-i", cue.path, "-o", out.path]
+                if overwrite { args.append("-f") }
+                let s2 = await runChdman(args, id: id, label: label) { jobFraction(disc: n, discProgress: $0 * (1 - verifyShare)) }
+                if s2 != 0 || cancelRequested {
+                    try? fm.removeItem(at: out)
+                    return fail(cancelRequested ? "Cancelled" : Converter.chdmanFailure(s2))
+                }
+                made.append(out)
+                // A PBP's size is shared between its discs; a CUE/GDI/ISO counts its own track files.
+                bytesIn += isPBP ? totalSize([src]) / discCount : totalSize(Converter.sourceFiles(for: cue))
+                bytesOut += totalSize([out])
+                wroteThisDisc = true
             }
-            if s2 != 0 || cancelRequested {
-                try? fm.removeItem(at: out)
-                return fail(cancelRequested ? "Cancelled" : "chdman failed (exit \(s2)) — see log")
+
+            // Optional: check the CHD's checksums, including CHDs that already existed.
+            if verify {
+                let s3 = await runChdman(["verify", "-i", out.path], id: id, label: "Verifying\(disc)") {
+                    jobFraction(disc: n, discProgress: 1 - verifyShare + $0 * verifyShare)
+                }
+                if cancelRequested { return fail("Cancelled") }
+                if s3 != 0 {
+                    // Delete a CHD we just wrote; leave one that was already there for the user to look at.
+                    if wroteThisDisc { try? fm.removeItem(at: out) }
+                    let why = s3 == Converter.stalledStatus ? "chdman stopped responding" : "see log"
+                    return fail("\(out.lastPathComponent) failed verification\(wroteThisDisc ? " and was deleted" : "") — \(why)")
+                }
+                append("  verified \(out.lastPathComponent)")
             }
-            made.append(out)
         }
 
         // Multi-disc playlist
@@ -373,6 +475,12 @@ final class Converter: ObservableObject {
         }
 
         var summary = made.count == 1 ? made[0].lastPathComponent : "\(made.count) discs → CHD"
+        if skippedCount == made.count {
+            summary += " · already existed"
+        } else {
+            summary += " · " + Converter.describeSaving(input: bytesIn, output: bytesOut)
+        }
+        if verify { summary += " · verified" }
 
         // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
         if trashSources {
@@ -394,10 +502,216 @@ final class Converter: ObservableObject {
             }
         }
 
-        // If every CHD already existed, this job took no real time: keep it out of the speed estimate.
-        let didWork = made.count > 0 && !(made.count == skippedCount)
-        update(id) { $0.state = .done; $0.detail = summary; $0.progress = nil; $0.timed = didWork }
+        // If every CHD already existed (and wasn't verified), this job took no real time:
+        // keep it out of the speed estimate.
+        let didWork = made.count > 0 && (made.count != skippedCount || verify)
+        update(id) {
+            $0.state = .done; $0.detail = summary; $0.progress = nil; $0.timed = didWork
+            $0.bytesIn = bytesIn; $0.bytesOut = bytesOut
+        }
         append("✓ \(summary)")
+    }
+
+    /// "412 MB, saved 260 MB (39%)", or just the size when the CHD isn't smaller (common for PBPs,
+    /// which are already compressed).
+    nonisolated static func describeSaving(input: Double, output: Double) -> String {
+        guard input > output, input > 0 else { return formatBytes(output) }
+        return "\(formatBytes(output)), saved \(formatBytes(input - output)) (\(Int(((input - output) / input * 100).rounded()))%)"
+    }
+
+    /// Runs chdman, showing its "45.3% complete" counter as `label — 45%` on the job.
+    /// `fraction` maps the tool's 0…1 progress onto the whole job's 0…1 for the batch bar.
+    /// Returned by runChdman when chdman stopped making progress and was stopped.
+    static let stalledStatus: Int32 = -2
+    /// How long chdman may go without its percentage moving. Its counter steps every 0.1%, which
+    /// even a 9 GB DVD on a slow drive passes in seconds; chdman can hang forever verifying a damaged CHD.
+    static var stallTimeout: TimeInterval = 180
+
+    /// The failure text for a chdman exit status.
+    static func chdmanFailure(_ status: Int32) -> String {
+        status == stalledStatus
+            ? "chdman stopped responding (no progress for \(Int(stallTimeout / 60)) minutes) — the file may be damaged"
+            : "chdman failed (exit \(status)) — see log"
+    }
+
+    private func runChdman(_ args: [String], id: UUID, label: String,
+                           fraction: @escaping (Double) -> Double) async -> Int32 {
+        update(id) { $0.detail = label + "…"; $0.progress = 0; $0.fraction = fraction(0) }
+        var lastPct = -1.0
+        var lastChange = Date()
+        var stalled = false
+        let watchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(min(5, Converter.stallTimeout / 2)))
+                if Task.isCancelled { break }
+                if Date().timeIntervalSince(lastChange) > Converter.stallTimeout {
+                    stalled = true
+                    self?.append("  chdman made no progress for \(Int(Converter.stallTimeout)) seconds; stopping it.")
+                    self?.currentProcess?.terminate()
+                    break
+                }
+            }
+        }
+        defer { watchdog.cancel() }
+        let status = await run(chdman!, args) { [weak self] line in
+            if let r = line.range(of: #"([0-9.]+)% complete"#, options: .regularExpression) {
+                let pct = Double(line[r].split(separator: "%")[0]) ?? 0
+                if pct != lastPct { lastPct = pct; lastChange = Date() }
+                self?.update(id) {
+                    $0.progress = pct / 100
+                    $0.fraction = fraction(pct / 100)
+                    $0.detail = "\(label) — \(Int(pct))%"
+                }
+            } else {
+                self?.append("  [chdman] \(line)")
+            }
+        }
+        return stalled ? Converter.stalledStatus : status
+    }
+
+    // MARK: CHD → BIN/CUE
+
+    /// Unpacks a CHD back to what it was made from: BIN/CUE for a CD, GDI and tracks for a
+    /// Dreamcast GD-ROM, or ISO for a DVD.
+    private func extract(index: Int) async {
+        let job = jobs[index]
+        let id = job.id
+        let fm = FileManager.default
+        let src = job.url
+        let base = src.deletingPathExtension().lastPathComponent
+        let outDir = outputDir ?? src.deletingLastPathComponent()
+
+        func fail(_ msg: String) {
+            update(id) { $0.state = .failed; $0.detail = msg; $0.progress = nil; $0.timed = false }
+            append("✗ \(src.lastPathComponent): \(msg)")
+        }
+
+        update(id) { $0.state = .working; $0.detail = "Reading CHD…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
+        append("▶ \(src.lastPathComponent)")
+        do { try fm.createDirectory(at: outDir, withIntermediateDirectories: true) }
+        catch { return fail("Can't create folder: \(error.localizedDescription)") }
+
+        // `chdman info` lists metadata tags: CHT2/CHCD/CHTR = CD, CHGD/CHGT = GD-ROM, "DVD " = DVD.
+        var tags: [String] = []
+        let s0 = await run(chdman!, ["info", "-i", src.path]) { [weak self] line in
+            if let r = line.range(of: #"Tag='[^']{4}'"#, options: .regularExpression) {
+                tags.append(String(line[r].dropFirst(5).prefix(4)))
+            }
+            if line.hasPrefix("Error") { self?.append("  [chdman] \(line)") }
+        }
+        if cancelRequested { return fail("Cancelled") }
+        guard s0 == 0 else { return fail("chdman couldn't read this CHD (exit \(s0)) — see log") }
+
+        let command: String, out: URL
+        if tags.contains(where: { $0 == "CHGD" || $0 == "CHGT" }) {
+            command = "extractcd"; out = outDir.appendingPathComponent(base + ".gdi")
+        } else if tags.contains(where: { ["CHT2", "CHCD", "CHTR"].contains($0) }) {
+            command = "extractcd"; out = outDir.appendingPathComponent(base + ".cue")
+        } else if tags.contains("DVD ") {
+            command = "extractdvd"; out = outDir.appendingPathComponent(base + ".iso")
+        } else {
+            return fail("Not a CD or DVD image, so it can't be extracted to BIN/CUE or ISO")
+        }
+
+        if fm.fileExists(atPath: out.path) && !overwrite {
+            append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
+            update(id) { $0.state = .done; $0.detail = "\(out.lastPathComponent) · already existed"; $0.progress = nil; $0.timed = false }
+            return
+        }
+
+        var args = [command, "-i", src.path, "-o", out.path]
+        if overwrite { args.append("-f") }
+        let s1 = await runChdman(args, id: id, label: "Extracting") { $0 }
+        // What was written: the .cue/.gdi plus the track files it lists, or the .iso.
+        let written = fm.fileExists(atPath: out.path) ? Converter.sourceFiles(for: out) : []
+        if s1 != 0 || cancelRequested {
+            for f in written { try? fm.removeItem(at: f) }
+            if command == "extractcd" && out.pathExtension == "cue" {
+                try? fm.removeItem(at: out.deletingPathExtension().appendingPathExtension("bin"))
+            }
+            return fail(cancelRequested ? "Cancelled" : Converter.chdmanFailure(s1))
+        }
+
+        let size = totalSize(written)
+        let extra = written.count - 1
+        var summary = out.lastPathComponent + (extra > 0 ? " + \(extra) track file\(extra == 1 ? "" : "s")" : "")
+        summary += " · \(formatBytes(size))"
+
+        if trashSources {
+            if size > 0 {
+                do { try fm.trashItem(at: src, resultingItemURL: nil); append("  moved \(src.lastPathComponent) to Trash"); summary += " · CHD moved to Trash" }
+                catch { append("  couldn't move \(src.lastPathComponent) to Trash: \(error.localizedDescription)") }
+            } else {
+                append("  Kept the CHD: the extracted files look empty.")
+            }
+        }
+        update(id) {
+            $0.state = .done; $0.detail = summary; $0.progress = nil
+            $0.bytesIn = job.weight; $0.bytesOut = size
+        }
+        append("✓ \(summary)")
+    }
+
+    // MARK: ISO type
+
+    /// Guesses whether an .iso is a DVD (→ createdvd) or a CD (→ createcd), with a reason for the log.
+    /// PSP UMDs and PS2 DVDs are DVDs; so is anything too big to fit on a CD.
+    nonisolated static func isoLooksLikeDVD(_ url: URL) -> (Bool, String) {
+        let size = totalSize([url])
+        let cdCapacity = 900_000_000.0   // a 99-minute CD holds about 870 MB of 2048-byte sectors
+        let names = isoRootNames(url)
+        if names.contains("PSP_GAME") || names.contains("UMD_DATA.BIN") { return (true, "PSP game") }
+        if names.contains("SYSTEM.CNF"), let cnf = isoRootFile(url, named: "SYSTEM.CNF"),
+           String(decoding: cnf, as: UTF8.self).uppercased().contains("BOOT2") {
+            return (true, "PlayStation 2 game")
+        }
+        if size > cdCapacity { return (true, "\(formatBytes(size)) is too big for a CD") }
+        return (false, "\(formatBytes(size)) fits on a CD")
+    }
+
+    /// Reads an ISO 9660 image's root directory: file and folder names (upper-cased, without ";1"),
+    /// with each one's location and size.
+    nonisolated static func isoRootEntries(_ url: URL) -> [String: (lba: UInt64, size: Int)] {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return [:] }
+        defer { try? h.close() }
+        func read(_ offset: UInt64, _ count: Int) -> [UInt8] {
+            guard (try? h.seek(toOffset: offset)) != nil, let d = try? h.read(upToCount: count) else { return [] }
+            return [UInt8](d)
+        }
+        func le32(_ b: [UInt8], _ i: Int) -> Int {
+            Int(b[i]) | Int(b[i + 1]) << 8 | Int(b[i + 2]) << 16 | Int(b[i + 3]) << 24
+        }
+        // Primary volume descriptor at sector 16: type 1, "CD001".
+        let pvd = read(16 * 2048, 2048)
+        guard pvd.count == 2048, pvd[0] == 1, Array(pvd[1...5]) == Array("CD001".utf8) else { return [:] }
+        let rootLBA = le32(pvd, 156 + 2), rootSize = min(le32(pvd, 156 + 10), 64 * 1024)
+        let dir = read(UInt64(rootLBA) * 2048, rootSize)
+        var result: [String: (lba: UInt64, size: Int)] = [:]
+        var i = 0
+        while i < dir.count {
+            let len = Int(dir[i])
+            if len == 0 { i = (i / 2048 + 1) * 2048; continue }   // records don't cross sector boundaries
+            guard i + len <= dir.count, len >= 34 else { break }
+            let nameLen = Int(dir[i + 32])
+            if nameLen > 0, i + 33 + nameLen <= dir.count {
+                var name = String(decoding: dir[(i + 33)..<(i + 33 + nameLen)], as: UTF8.self).uppercased()
+                if let semi = name.firstIndex(of: ";") { name = String(name[..<semi]) }
+                if name.hasSuffix(".") { name.removeLast() }
+                result[name] = (UInt64(le32(dir, i + 2)), le32(dir, i + 10))
+            }
+            i += len
+        }
+        return result
+    }
+
+    nonisolated static func isoRootNames(_ url: URL) -> Set<String> { Set(isoRootEntries(url).keys) }
+
+    nonisolated static func isoRootFile(_ url: URL, named name: String) -> Data? {
+        guard let e = isoRootEntries(url)[name], e.size > 0, e.size < 64 * 1024,
+              let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard (try? h.seek(toOffset: e.lba * 2048)) != nil else { return nil }
+        return try? h.read(upToCount: e.size)
     }
 
     /// The input file plus any track files it references (for .cue and .gdi), limited to files that
@@ -564,6 +878,31 @@ final class UpdateChecker: ObservableObject {
     }
 }
 
+// MARK: - Notifications
+
+/// Posts "Batch finished" to Notification Center when a batch ends while you're in another app.
+enum Notifier {
+    /// Asks once; macOS remembers the answer, and it can be changed in System Settings → Notifications.
+    /// Notification Center only works for a real .app bundle.
+    static var available: Bool { Bundle.main.bundleIdentifier != nil }
+
+    static func requestPermission() {
+        guard available else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    @MainActor
+    static func batchFinished(counts: String, saved: String?, failed: Bool) {
+        guard available, !NSApp.isActive else { return }   // you're looking at the window already
+        let content = UNMutableNotificationContent()
+        content.title = failed ? "Batch finished with errors" : "Batch finished"
+        content.body = ([counts] + (saved.map { [$0] } ?? [])).joined(separator: " · ")
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "batch-finished", content: content, trigger: nil))
+    }
+}
+
 extension Optional {
     /// Keeps the value only if it passes `test`.
     func filter(_ test: (Wrapped) -> Bool) -> Wrapped? { flatMap { test($0) ? $0 : nil } }
@@ -641,6 +980,10 @@ struct ContentView: View {
         .onChange(of: c.isRunning) { _, running in
             if !running { NSApp.dockTile.badgeLabel = nil }
         }
+        // Coming back from Terminal after installing chdman clears the banner without a relaunch.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            c.recheckTools()
+        }
     }
 
     /// Explains what Stop Converting does to the current file and the rest of the queue.
@@ -675,13 +1018,13 @@ struct ContentView: View {
             status = "Converting file \(min(finished + 1, total)) of \(total)"
             timeText = c.batchTimeRemaining(now: now).map(Converter.describeRemaining) ?? "Estimating time left…"
         } else {
-            var parts = ["\(c.batchDoneCount) converted"]
-            if c.batchFailedCount > 0 { parts.append("\(c.batchFailedCount) failed") }
-            if c.batchQueuedCount > 0 { parts.append("\(c.batchQueuedCount) not started") }
-            status = "Batch finished: " + parts.joined(separator: ", ")
+            status = "Batch finished: " + c.batchCountsText
+            var parts: [String] = []
             if let s = c.batchStart, let e = c.batchEnd {
-                timeText = "Took " + Converter.describeDuration(e.timeIntervalSince(s))
+                parts.append("Took " + Converter.describeDuration(e.timeIntervalSince(s)))
             }
+            if let saved = c.batchSavedText { parts.append(saved) }
+            timeText = parts.joined(separator: " · ")
         }
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -702,18 +1045,49 @@ struct ContentView: View {
         }
     }
 
+    static let installCommand = "brew install rom-tools"
+    @State private var copiedCommand = false
+
     private var missingToolsBanner: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 8) {
             if c.chdman == nil {
-                Label("chdman not found. Install it in Terminal with:  brew install rom-tools", systemImage: "exclamationmark.triangle.fill")
+                Label("Converterator needs chdman, from the free rom-tools package.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                if Converter.homebrewInstalled {
+                    Text("Open Terminal, paste this command and press Return. The banner goes away once it's installed.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 4) {
+                        Text("First install Homebrew by following the steps at").foregroundStyle(.secondary)
+                        Link("brew.sh", destination: URL(string: "https://brew.sh")!)
+                        Text("Then run this in Terminal:").foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Text(Self.installCommand)
+                        .font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 4))
+                    Button(copiedCommand ? "Copied" : "Copy Command") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(Self.installCommand, forType: .string)
+                        copiedCommand = true
+                    }
+                    Button("Open Terminal") {
+                        if let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+                            NSWorkspace.shared.openApplication(at: terminal, configuration: .init())
+                        }
+                    }
+                    Button("Check Again") { c.recheckTools() }
+                }
             }
             if c.psxpackager == nil {
-                Label("psxpackager not found inside the app or in /opt/homebrew/bin.", systemImage: "exclamationmark.triangle.fill")
+                Label("PSXPackager is missing from the app, so .pbp files can't be converted. Download Converterator again.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
             }
         }
         .font(.callout)
-        .foregroundStyle(.orange)
-        .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
         .background(Color.orange.opacity(0.12))
@@ -723,7 +1097,7 @@ struct ContentView: View {
         VStack(spacing: 10) {
             Image(systemName: "opticaldisc").font(.system(size: 48)).foregroundStyle(.secondary)
             Text("Drop .pbp, .cue, .gdi or .iso files (or folders) here").font(.title3)
-            Text("BIN/CUE, GDI and ISO images are compressed straight to CHD. PBPs are unpacked to BIN/CUE first, and those temporary files are cleaned up.")
+            Text("BIN/CUE, GDI and ISO images are compressed straight to CHD. PBPs are unpacked to BIN/CUE first, and those temporary files are cleaned up. Drop a .chd file to turn it back into BIN/CUE, GDI or ISO.")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
             Button("Add Files…", action: pickFiles).padding(.top, 4)
         }
@@ -766,7 +1140,7 @@ struct ContentView: View {
     private var options: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Save CHDs to:")
+                Text("Save to:")
                 Text(c.outputDir?.path(percentEncoded: false) ?? "Same folder as each source file")
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                 Spacer()
@@ -777,8 +1151,17 @@ struct ContentView: View {
                 Toggle("Overwrite existing CHDs", isOn: $c.overwrite)
                 Toggle("Make .m3u playlist for multi-disc games", isOn: $c.makeM3U)
             }
+            HStack(spacing: 20) {
+                Toggle("Verify CHDs after writing", isOn: $c.verify)
+                    .help("Checks each CHD's checksums with chdman verify. CHDs that already exist are checked too, so you can re-add a folder to test it.")
+                Picker("ISO images:", selection: $c.isoMode) {
+                    ForEach(ISOMode.allCases) { Text($0.label).tag($0) }
+                }
+                .fixedSize()
+                .help("Automatic makes a DVD CHD for PS2 and PSP games and anything bigger than a CD, and a CD CHD otherwise.")
+            }
             Toggle("Move source files to Trash after a successful conversion", isOn: $c.trashSources)
-                .help("Moves the .pbp/.cue/.gdi/.iso file and any .bin tracks it lists to the Trash, only after its CHD is written. Turns off each time the app starts.")
+                .help("Moves the .pbp/.cue/.gdi/.iso file and any .bin tracks it lists to the Trash, only after its CHD is written. For a .chd you extract, moves the .chd. Turns off each time the app starts.")
         }
         .disabled(c.isRunning)
     }
@@ -828,8 +1211,8 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
-        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin"].compactMap { UTType(filenameExtension: $0) } + [.folder]
-        panel.message = "Choose .pbp, .cue, .gdi or .iso files, or folders containing them"
+        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd"].compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.message = "Choose .pbp, .cue, .gdi or .iso files or folders to compress, or .chd files to extract"
         present(panel) { c.add(panel.urls) }
     }
 

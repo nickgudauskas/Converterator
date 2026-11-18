@@ -5,7 +5,7 @@
 
 # Converterator
 
-A small native macOS app for turning PlayStation-era disc images into compressed **CHD** files, the format preferred by RetroArch, DuckStation, MAME and most modern emulators.
+A small native macOS app for turning PlayStation-era disc images into compressed **CHD** files, the format preferred by RetroArch, DuckStation, PCSX2, PPSSPP, MAME and most modern emulators. It can also turn a CHD back into BIN/CUE, GDI or ISO.
 
 Drop files or whole folders in, click **Convert**, and you're done.
 
@@ -24,18 +24,25 @@ Drop files or whole folders in, click **Convert**, and you're done.
 | `.pbp` (PSP / PS1 Classics EBOOT) | Unpacked to BIN/CUE with [PSXPackager](https://github.com/RupertAvery/PSXPackager), then compressed with `chdman`. Temporary files are deleted afterwards. |
 | `.cue` + `.bin` | Compressed straight to CHD with `chdman`. |
 | `.gdi` | Compressed straight to CHD with `chdman`. |
-| `.iso` | Compressed straight to CHD with `chdman`. |
+| `.iso` | Compressed straight to CHD with `chdman`, as a DVD or CD image (see below). |
+| `.chd` | Extracted back to `.cue` + `.bin` (CDs), `.gdi` + tracks (Dreamcast) or `.iso` (DVDs). |
 
 Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 
+**ISO images: CD or DVD.** PS2 and PSP games need DVD-type CHDs (`chdman createdvd`), and most other systems need CD-type ones. With **ISO images: Automatic**, Converterator looks inside each ISO: a PSP game (`PSP_GAME`) or a PS2 game (`SYSTEM.CNF` with `BOOT2`) becomes a DVD CHD, as does anything too big to fit on a CD. Everything else becomes a CD CHD. The log says which was chosen and why. Choose **Always CD** or **Always DVD** to override it. PS2 games that came on CD are best kept as BIN/CUE, which always becomes a CD CHD.
+
+**Extracting CHDs.** `.chd` files are only picked up when you add them one by one, never from a folder scan, so re-adding a folder you already converted doesn't unpack everything in it.
+
 ## Features
 
-- **Batch conversion.** Add any number of files or folders. Folders are searched recursively, and everything is converted one file at a time, with a status and progress bar for each. An overall bar shows progress through the whole batch ("Converting file 3 of 10") with an estimate of the time left, and the Dock icon shows the batch percentage. When the batch ends, a summary of converted, failed and not-started files and the total time taken stays up. Progress is weighted by file size, so big discs count for more than small ones, and CHDs that already exist don't throw off the estimate.
+- **Batch conversion.** Add any number of files or folders. Folders are searched recursively, and everything is converted one file at a time, with a status and progress bar for each. An overall bar shows progress through the whole batch ("Converting file 3 of 10") with an estimate of the time left, and the Dock icon shows the batch percentage. When the batch ends, a summary of converted, failed and not-started files, the total time taken and the space saved stays up, and if you're in another app a notification tells you it's done. The Mac won't idle-sleep while a batch runs (the display still can, and closing a laptop's lid still sleeps it). Progress is weighted by file size, so big discs count for more than small ones, and CHDs that already exist don't throw off the estimate.
 - **Drag and drop.** Drop files on the window or on the Dock icon, or use **Open With → Converterator** in Finder. The app never makes itself the default for these file types.
+- **Space saved.** Each finished file shows its CHD's size and how much smaller it is than the original, for example "412 MB, saved 260 MB (39%)". PBPs are already compressed, so their CHDs often aren't smaller.
+- **Verify.** Turn on **Verify CHDs after writing** to check each CHD's checksums with `chdman verify`. A new CHD that fails is deleted and the originals are kept. CHDs that already exist are verified too, so adding a folder again with Verify on checks everything in it. If `chdman` stops making progress for 3 minutes (it can hang on a badly damaged CHD), the file is marked failed and the batch moves on.
 - **Multi-disc PBPs.** Each disc becomes its own `.chd`. An `.m3u` playlist is written so emulators can swap discs (this can be turned off).
-- **Output location.** CHDs are saved next to each source file by default, or all in one folder you choose with **Save CHDs to:**.
+- **Output location.** Files are saved next to each source file by default, or all in one folder you choose with **Save to:**.
 - **Skips existing CHDs.** Re-running a folder only converts what's new. Turn on **Overwrite existing CHDs** to replace them instead.
-- **Optional cleanup.** Turn on **Move source files to Trash after a successful conversion** to clear out the originals. That's the `.pbp`, `.cue`, `.gdi` or `.iso`, plus any `.bin` or track files a `.cue` or `.gdi` lists. Files go to the Trash, so they can be restored, and only after every CHD for that game was newly written. If a CHD already existed and was skipped, the originals stay. The option turns itself off each time the app starts.
+- **Optional cleanup.** Turn on **Move source files to Trash after a successful conversion** to clear out the originals. That's the `.pbp`, `.cue`, `.gdi` or `.iso`, plus any `.bin` or track files a `.cue` or `.gdi` lists. When extracting, it's the `.chd`. Files go to the Trash, so they can be restored, and only after every CHD for that game was newly written. If a CHD already existed and was skipped, the originals stay. The option turns itself off each time the app starts.
 - **Cancel and retry.** **Cancel** asks you to confirm, then stops the current file and deletes its unfinished CHD. Finished CHDs and your original files are kept, and files not yet started stay in the list. **Clear → Retry Failed** re-queues only the failures.
 - **Log.** **Show Log** displays the full output from PSXPackager and `chdman` for troubleshooting.
 - **Check for updates.** Click **Check for Updates** under the version number, or choose **Converterator → Check for Updates…**. The app asks GitHub for the latest release and, if it's newer, offers to open the download page. It only checks when you ask and sends nothing about you.
@@ -47,7 +54,7 @@ Get `Converterator.zip` from the [latest release](https://github.com/nickgudausk
 
 Release builds from 1.2.1 on are signed with a Developer ID and **notarized by Apple**, so they open with a normal double-click. (Releases 1.0–1.2.0 weren't notarized and needed **System Settings → Privacy & Security → Open Anyway** the first time.)
 
-You still need to install `chdman` (and .NET for PBPs). See the requirements below.
+You still need to install `chdman`. See the requirements below.
 
 ## Requirements
 
@@ -56,13 +63,11 @@ You still need to install `chdman` (and .NET for PBPs). See the requirements bel
   ```bash
   brew install rom-tools
   ```
-- PSXPackager needs the **.NET 10 runtime** to unpack `.pbp` files:
-  ```bash
-  brew install dotnet
-  ```
-  This is only needed for `.pbp` input. CUE, GDI and ISO conversion works without it.
+  If you don't have Homebrew, install it first from [brew.sh](https://brew.sh).
 
-If `chdman` or PSXPackager can't be found, the app shows a warning banner at the top of the window.
+Nothing else is needed. PSXPackager is built into the app and carries its own copy of .NET, so you don't need to install .NET.
+
+If `chdman` can't be found, a banner at the top of the window explains how to install it, with buttons to copy the command and open Terminal. It disappears by itself once `chdman` is installed.
 
 ## Building
 
