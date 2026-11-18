@@ -1227,6 +1227,10 @@ final class Cleanup: ObservableObject {
 
     func cancel() { cancelled = true }
 
+    func reset() {
+        phase = .idle; folder = nil; items = []; summary = ""; ambiguous = 0; progress = 0
+    }
+
     /// Verifies (optionally) and trashes every included item. Items whose CHD fails stay put.
     func run() {
         let chosen = selected
@@ -1408,6 +1412,8 @@ struct CleanupView: View {
     @ObservedObject private var m = Cleanup.shared
     @ObservedObject private var c = Converter.shared
     @State private var confirm = false
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1459,6 +1465,11 @@ struct CleanupView: View {
         case .done:
             VStack(alignment: .leading, spacing: 8) {
                 Text(m.summary)
+                HStack {
+                    Button("Back to Converterator", action: backToMain)
+                        .keyboardShortcut(.defaultAction)
+                    Button("Clean Up Another Folder…", action: chooseFolder)
+                }
                 if !m.items.isEmpty { review }
             }
         }
@@ -1498,7 +1509,8 @@ struct CleanupView: View {
                 Spacer()
                 Button("Move to Trash…") { confirm = true }
                     .disabled(m.selected.isEmpty || c.isRunning || (m.verifyFirst && c.chdman == nil))
-                    .keyboardShortcut(.defaultAction)
+                    // Return means "Back to Converterator" once the cleanup is done.
+                    .keyboardShortcut(m.phase == .review ? .defaultAction : nil)
             }
             if c.isRunning {
                 Text("Wait for the current batch to finish before cleaning up.").font(.caption).foregroundStyle(.orange)
@@ -1512,6 +1524,13 @@ struct CleanupView: View {
         let files = extra > 0 ? " + \(extra) track file\(extra == 1 ? "" : "s")" : ""
         let chd = item.chds.count == 1 ? item.chds[0].lastPathComponent : "\(item.chds.count) CHDs"
         return "\(formatBytes(item.bytes))\(files) · converted to \(chd)"
+    }
+
+    /// Brings the main window forward (reopening it if it was closed) and closes this one.
+    private func backToMain() {
+        m.reset()   // next time, the window starts fresh
+        openWindow(id: "main")
+        dismissWindow(id: "cleanup")
     }
 
     private func chooseFolder() {
