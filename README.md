@@ -28,6 +28,23 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 - **Log.** **Show Log** displays the full output from PSXPackager and `chdman` for troubleshooting.
 - Your output folder and option settings are remembered between launches.
 
+## Download
+
+Get `Converterator.zip` from the [latest release](https://github.com/nickgudauskas/Converterator/releases/latest), unzip it, and move **Converterator.app** to your Applications folder. Release builds are for **Apple Silicon** Macs. On an Intel Mac, [build it yourself](#building).
+
+The app is free and not notarized by Apple, so macOS blocks it the first time you open it. To allow it:
+
+1. Open Converterator once and dismiss the warning.
+2. Go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to Converterator.
+
+If PBP conversion still fails after that, clear the download flag in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Converterator.app
+```
+
+You still need to install `chdman` (and .NET for PBPs). See the requirements below.
+
 ## Requirements
 
 - macOS 14 (Sonoma) or later. Apple Silicon or Intel.
@@ -55,7 +72,7 @@ cd Converterator
 
 The first build downloads PSXPackager v1.8.0 from its GitHub releases into `vendor/` and bundles it inside the app. The result is `Converterator.app` in the same folder. Move it to `/Applications` to install it.
 
-The app is ad-hoc signed for your own Mac. It isn't notarized, so copies sent to other Macs will be blocked by Gatekeeper until they're allowed in **System Settings → Privacy & Security**.
+The app is ad-hoc signed and not notarized. Copies moved to other Macs need the same **Open Anyway** step described under [Download](#download).
 
 ### Changing the icon
 
@@ -81,8 +98,8 @@ iconutil -c icns AppIcon.iconset -o icon.icns && rm -rf AppIcon.iconset
 - [PSXPackager](https://github.com/RupertAvery/PSXPackager) by RupertAvery, for PBP extraction.
 - [chdman](https://docs.mamedev.org/tools/chdman.html) from the MAME project, for CHD compression.
 
-Converterator only runs these tools. It doesn't include or modify their code.
+Converterator doesn't modify either tool. It runs them as separate programs. `chdman` isn't included; you install it yourself. The built app includes an unmodified copy of PSXPackager, which `build.sh` downloads.
 
 ## License
 
-Converterator is released under the [MIT License](LICENSE). This covers Converterator's own code only. PSXPackager and chdman keep their own licenses.
+Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. chdman is part of MAME and keeps its own license.

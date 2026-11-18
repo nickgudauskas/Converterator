@@ -21,6 +21,11 @@ if [[ ! -x vendor/psxpackager/psxpackager ]]; then
   mv "vendor/psxpackager-$PSX_PLATFORM" vendor/psxpackager
   rm -f vendor/psxpackager.tar.gz vendor/psxpackager/README.md
 fi
+# PSXPackager is MIT-licensed; its license must travel with the copy bundled in the app.
+if [[ ! -f vendor/psxpackager/LICENSE ]]; then
+  curl -fsSL -o vendor/psxpackager/LICENSE \
+    "https://raw.githubusercontent.com/RupertAvery/PSXPackager/$PSX_VERSION/LICENSE"
+fi
 
 rm -rf "$APP" build
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -30,6 +35,7 @@ swiftc -parse-as-library -swift-version 5 -O \
   main.swift -o "$APP/Contents/MacOS/Converterator"
 
 cp -R vendor/psxpackager "$APP/Contents/Resources/psxpackager"
+cp LICENSE "$APP/Contents/Resources/LICENSE"
 
 # Optional custom icon: drop an icon.icns next to this script.
 if [[ -f icon.icns ]]; then cp icon.icns "$APP/Contents/Resources/AppIcon.icns"; fi
