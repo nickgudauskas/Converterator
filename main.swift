@@ -61,6 +61,10 @@ final class Converter: ObservableObject {
     let chdman: URL? = Converter.findTool("chdman")
 
     private var currentProcess: Process?
+    /// Move source files to the Trash after a successful conversion.
+    /// Deliberately not remembered between launches, so it's never on by surprise.
+    @Published var trashSources = false
+
     private var cancelRequested = false
 
     init() {
@@ -220,6 +224,7 @@ final class Converter: ObservableObject {
 
         // Step 2: BIN/CUE → CHD, one per disc
         var made: [URL] = []
+        var allNewlyCreated = true   // false if any CHD was skipped because it already existed
         for (n, cue) in cues.enumerated() {
             let name = cues.count == 1 ? base : cue.deletingPathExtension().lastPathComponent
             let out = outDir.appendingPathComponent(name + ".chd")
@@ -228,6 +233,7 @@ final class Converter: ObservableObject {
             if fm.fileExists(atPath: out.path) && !overwrite {
                 append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
                 made.append(out)
+                allNewlyCreated = false
                 continue
             }
             update(id) { $0.detail = label + "…"; $0.progress = 0 }
@@ -257,9 +263,70 @@ final class Converter: ObservableObject {
             catch { append("  couldn't write \(m3u.lastPathComponent): \(error.localizedDescription)") }
         }
 
-        let summary = made.count == 1 ? made[0].lastPathComponent : "\(made.count) discs → CHD"
+        var summary = made.count == 1 ? made[0].lastPathComponent : "\(made.count) discs → CHD"
+
+        // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
+        if trashSources {
+            let outputsOK = made.allSatisfy {
+                ((try? fm.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0) > 0
+            }
+            if !allNewlyCreated {
+                append("  Kept source files: a CHD already existed and wasn't rewritten.")
+            } else if !outputsOK {
+                append("  Kept source files: a CHD looks empty or missing.")
+            } else {
+                var trashed = 0
+                for f in Converter.sourceFiles(for: src) {
+                    do { try fm.trashItem(at: f, resultingItemURL: nil); trashed += 1 }
+                    catch { append("  couldn't move \(f.lastPathComponent) to Trash: \(error.localizedDescription)") }
+                }
+                append("  moved \(trashed) source file\(trashed == 1 ? "" : "s") to Trash")
+                summary += " · originals moved to Trash"
+            }
+        }
+
         update(id) { $0.state = .done; $0.detail = summary; $0.progress = nil }
         append("✓ \(summary)")
+    }
+
+    /// The input file plus any track files it references (for .cue and .gdi), limited to files that
+    /// exist inside the input's own folder.
+    nonisolated static func sourceFiles(for src: URL) -> [URL] {
+        let dir = src.deletingLastPathComponent().standardizedFileURL
+        let ext = src.pathExtension.lowercased()
+        var names: [String] = []
+
+        if ext == "cue" || ext == "gdi", let data = try? Data(contentsOf: src) {
+            let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            let lines = text.components(separatedBy: .newlines)
+            for (i, raw) in lines.enumerated() {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if let q1 = line.firstIndex(of: "\""), let q2 = line.lastIndex(of: "\""), q1 < q2 {
+                    // Quoted file name: FILE "Game (Track 1).bin" BINARY  /  1 0 4 2352 "track 01.bin" 0
+                    if ext == "gdi" || line.uppercased().hasPrefix("FILE ") {
+                        names.append(String(line[line.index(after: q1)..<q2]))
+                    }
+                    continue
+                }
+                let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                if ext == "cue", parts.count >= 2, parts[0].uppercased() == "FILE" {
+                    names.append(parts[1])
+                } else if ext == "gdi", i > 0, parts.count >= 5 {
+                    names.append(parts[4])   // track# lba type sectorsize FILENAME offset
+                }
+            }
+        }
+
+        var result = [src]
+        var seen: Set<String> = [src.standardizedFileURL.path]
+        for name in names {
+            let f = dir.appendingPathComponent(name).standardizedFileURL
+            guard f.path.hasPrefix(dir.path + "/"),
+                  FileManager.default.fileExists(atPath: f.path),
+                  seen.insert(f.path).inserted else { continue }
+            result.append(f)
+        }
+        return result
     }
 
     /// Runs a command-line tool, streaming its output line by line to `onLine` on the main thread.
@@ -426,6 +493,8 @@ struct ContentView: View {
                 Toggle("Overwrite existing CHDs", isOn: $c.overwrite)
                 Toggle("Make .m3u playlist for multi-disc games", isOn: $c.makeM3U)
             }
+            Toggle("Move source files to Trash after a successful conversion", isOn: $c.trashSources)
+                .help("Moves the .pbp/.cue/.gdi/.iso file and any .bin tracks it lists to the Trash, only after its CHD is written. Turns off each time the app starts.")
         }
         .disabled(c.isRunning)
     }
