@@ -49,8 +49,13 @@ cp -R vendor/osx-arm64/Resources "$PSX/Resources"   # identical in both builds
 cp vendor/LICENSE-psxpackager "$PSX/LICENSE"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 
-# Optional custom icon: drop an icon.icns next to this script.
-if [[ -f icon.icns ]]; then cp icon.icns "$APP/Contents/Resources/AppIcon.icns"; fi
+# App icon: compile the Icon Composer icon (light + dark variants, made by make_icon.swift).
+# actool writes Assets.car (used by macOS for appearance-aware icons) and AppIcon.icns (fallback).
+xcrun actool AppIcon.icon --compile "$APP/Contents/Resources" \
+  --platform macosx --minimum-deployment-target 14.0 \
+  --app-icon AppIcon --output-partial-info-plist build/actool-info.plist \
+  --output-format human-readable-text --notices --warnings --errors | grep -v "^/\* com.apple.actool" || true
+[[ -f "$APP/Contents/Resources/Assets.car" ]] || { echo "actool failed to build the icon"; exit 1; }
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -62,9 +67,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.4.0</string>
-  <key>CFBundleVersion</key><string>7</string>
+  <key>CFBundleShortVersionString</key><string>1.4.1</string>
+  <key>CFBundleVersion</key><string>8</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleDocumentTypes</key>

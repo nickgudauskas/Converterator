@@ -1,4 +1,7 @@
-<p align="center"><img src="icon-preview.png" width="160" alt="Converterator icon"></p>
+<p align="center">
+  <img src="icon-preview.png" width="160" alt="Converterator icon">
+  <img src="icon-preview-dark.png" width="160" alt="Converterator icon in dark mode">
+</p>
 
 # Converterator
 
@@ -91,11 +94,12 @@ To use a profile with a different name, set `NOTARY_PROFILE`.
 
 ### Changing the icon
 
-The icon is drawn in code by `make_icon.swift`. Edit it, then regenerate `icon.icns` and `icon-preview.png` and rebuild:
+The icon is drawn in code by `make_icon.swift`. It writes `AppIcon.icon`, an [Icon Composer](https://developer.apple.com/icon-composer/) icon with a purple background in light mode, a graphite one in dark mode, and the disc artwork as a layer. On macOS 26 and later, the system uses the matching version for **System Settings → Appearance → Icon & widget style** (Default, Dark, Clear or Tinted). Earlier versions of macOS show the light icon. `build.sh` compiles it with `actool`.
+
+Edit `make_icon.swift`, then regenerate and rebuild:
 
 ```bash
 swift make_icon.swift
-iconutil -c icns AppIcon.iconset -o icon.icns && rm -rf AppIcon.iconset
 ./build.sh
 ```
 
@@ -107,8 +111,9 @@ iconutil -c icns AppIcon.iconset -o icon.icns && rm -rf AppIcon.iconset
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
 | `notarize.sh` | Builds with Developer ID signing, notarizes with Apple, staples, and zips into `dist/`. |
 | `psxpackager.entitlements` | Hardened-runtime permissions the bundled .NET PSXPackager needs. |
-| `make_icon.swift` | Draws the app icon. |
-| `icon.icns`, `icon-preview.png` | The generated icon. |
+| `make_icon.swift` | Draws the app icon in light and dark versions. |
+| `AppIcon.icon` | The generated Icon Composer icon that `build.sh` compiles into the app. |
+| `icon-preview.png`, `icon-preview-dark.png` | Full-size previews of the light and dark icons. |
 
 ## Credits
 
