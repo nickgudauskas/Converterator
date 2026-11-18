@@ -82,3 +82,7 @@ iconutil -c icns AppIcon.iconset -o icon.icns && rm -rf AppIcon.iconset
 - [chdman](https://docs.mamedev.org/tools/chdman.html) from the MAME project, for CHD compression.
 
 Converterator only runs these tools. It doesn't include or modify their code.
+
+## License
+
+Converterator is released under the [MIT License](LICENSE). This covers Converterator's own code only. PSXPackager and chdman keep their own licenses.
