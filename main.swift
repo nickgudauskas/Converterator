@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import UserNotifications
+import CryptoKit
 
 // MARK: - Model
 
@@ -99,6 +100,10 @@ final class Converter: ObservableObject {
     @Published var verify: Bool {
         didSet { UserDefaults.standard.set(verify, forKey: "verify") }
     }
+    /// Start converting straight away when files arrive from Finder's "Convert with Converterator".
+    @Published var startFromFinder: Bool {
+        didSet { UserDefaults.standard.set(startFromFinder, forKey: "startFromFinder") }
+    }
     @Published var isoMode: ISOMode {
         didSet { UserDefaults.standard.set(isoMode.rawValue, forKey: "isoMode") }
     }
@@ -135,6 +140,7 @@ final class Converter: ObservableObject {
         makeM3U = d.object(forKey: "makeM3U") as? Bool ?? true
         verify = d.bool(forKey: "verify")
         isoMode = ISOMode(rawValue: d.string(forKey: "isoMode") ?? "") ?? .automatic
+        startFromFinder = d.object(forKey: "startFromFinder") as? Bool ?? true
     }
 
     /// chdman is needed for everything; PSXPackager only for .pbp files (checked per job).
@@ -166,7 +172,7 @@ final class Converter: ObservableObject {
             .map { URL(fileURLWithPath: $0) }
     }
 
-    static let toolEnvironment: [String: String] = {
+    nonisolated static let toolEnvironment: [String: String] = {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
         // PSXPackager is a self-contained .NET app (the runtime is inside it); nothing to point it at.
@@ -370,6 +376,7 @@ final class Converter: ObservableObject {
         var made: [URL] = []
         var skipped = 0                 // CHDs that already existed and weren't rewritten
         var bytesIn = 0.0, bytesOut = 0.0
+        var redump: [RedumpResult] = []  // one per game checked against Redump
     }
 
     private func convert(index: Int) async {
@@ -415,6 +422,7 @@ final class Converter: ObservableObject {
             else { return }
             total.made += r.made; total.skipped += r.skipped
             total.bytesIn += r.bytesIn; total.bytesOut += r.bytesOut
+            total.redump += r.redump
         }
         // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
         if isArchive && total.bytesOut > 0 { total.bytesIn = totalSize([src]) }
@@ -427,6 +435,8 @@ final class Converter: ObservableObject {
             summary += " · " + Converter.describeSaving(input: total.bytesIn, output: total.bytesOut)
         }
         if verify { summary += " · verified" }
+        let unmatched = total.redump.first { !$0.isMatch }
+        if !total.redump.isEmpty { summary += " · " + (unmatched?.short ?? "✓ Redump") }
 
         // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
         if trashSources {
@@ -435,6 +445,9 @@ final class Converter: ObservableObject {
                 append("  Kept source files: a CHD already existed and wasn't rewritten.")
             } else if !outputsOK {
                 append("  Kept source files: a CHD looks empty or missing.")
+            } else if unmatched != nil && RedumpDB.shared.keepUnmatched {
+                append("  Kept source files: the dump doesn't match Redump (change this in Settings).")
+                summary += " · originals kept"
             } else {
                 var trashed = 0
                 // An archive goes to the Trash as a whole; its unpacked copy is temporary anyway.
@@ -470,6 +483,25 @@ final class Converter: ObservableObject {
         // Catch a .cue/.gdi whose track files are missing before chdman gets halfway.
         let missing = Converter.missingTracks(for: src)
         if !missing.isEmpty { fail(Converter.describeMissing(missing)); return nil }
+
+        // Optional: compare the track files with Redump's list of known good dumps. PBPs are a
+        // repackaged format, so their contents never match Redump and aren't checked.
+        var redump: RedumpResult?
+        if !isPBP, RedumpDB.shared.active {
+            let index = RedumpDB.shared.index
+            let tracks = src.pathExtension.lowercased() == "iso" ? [src] : Array(Converter.sourceFiles(for: src).dropFirst())
+            update(id) { $0.detail = "Checking against Redump…"; $0.progress = 0 }
+            let r = await Task.detached {
+                RedumpResult.check(tracks: tracks, index: index) { p in
+                    Task { @MainActor in
+                        self.update(id) { $0.progress = p; $0.detail = "Checking against Redump — \(Int(p * 100))%" }
+                    }
+                }
+            }.value
+            if cancelRequested { fail("Cancelled"); return nil }
+            append("  \(r.long)")
+            redump = r
+        }
 
         // PBP extraction counts as the first 20% of the game, compression the rest.
         let compressStart = isPBP ? 0.2 : 0.0
@@ -561,6 +593,8 @@ final class Converter: ObservableObject {
                 append("  verified \(out.lastPathComponent)")
             }
         }
+
+        if let redump { result.redump = [redump] }
 
         // Multi-disc playlist
         if result.made.count > 1 && makeM3U {
@@ -948,6 +982,547 @@ final class Converter: ObservableObject {
                 cont.resume(returning: -1)
             }
         }
+    }
+}
+
+// MARK: - Redump
+
+/// Hashes of known good dumps, from Redump DAT files (Logiqx XML, one per system, from redump.org).
+struct RedumpIndex: Sendable {
+    struct Rom: Sendable { let game: String; let name: String }
+    /// SHA-1 (lowercase hex) of each track file → which game and file it is.
+    var roms: [String: [Rom]] = [:]
+    /// How many track files (not counting the .cue) each game has.
+    var trackCount: [String: Int] = [:]
+    var gameCount: Int { trackCount.count }
+    var isEmpty: Bool { roms.isEmpty }
+
+    mutating func merge(_ other: RedumpIndex) {
+        for (k, v) in other.roms { roms[k, default: []] += v }
+        trackCount.merge(other.trackCount) { a, _ in a }
+    }
+
+    /// Parses a Logiqx XML DAT (what redump.org publishes). Returns nil if it isn't one.
+    static func parse(_ data: Data) -> RedumpIndex? {
+        final class Delegate: NSObject, XMLParserDelegate {
+            var index = RedumpIndex()
+            var game: String?
+            var sawDatafile = false
+            func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?,
+                        qualifiedName: String?, attributes a: [String: String] = [:]) {
+                switch name {
+                case "datafile": sawDatafile = true
+                case "game", "machine": game = a["name"]
+                case "rom":
+                    guard let game, let rom = a["name"], let sha1 = a["sha1"]?.lowercased(), !sha1.isEmpty else { return }
+                    if (rom as NSString).pathExtension.lowercased() == "cue" { return }   // cue sheets differ in whitespace; tracks are what count
+                    index.roms[sha1, default: []].append(.init(game: game, name: rom))
+                    index.trackCount[game, default: 0] += 1
+                default: break
+                }
+            }
+            func parser(_ parser: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName: String?) {
+                if name == "game" || name == "machine" { game = nil }
+            }
+        }
+        let parser = XMLParser(data: data)
+        let d = Delegate()
+        parser.delegate = d
+        parser.shouldResolveExternalEntities = false
+        guard parser.parse(), d.sawDatafile else { return nil }
+        return d.index
+    }
+}
+
+enum RedumpResult: Sendable {
+    case match(String)                  // every track matches this game
+    case partial(String, Int, Int)      // game, tracks matched, tracks the game has
+    case noMatch
+
+    var isMatch: Bool { if case .match = self { return true } else { return false } }
+
+    /// Short text for the job's status line.
+    var short: String {
+        switch self {
+        case .match: return "✓ Redump"
+        case .partial: return "⚠ partial Redump match"
+        case .noMatch: return "⚠ not in Redump"
+        }
+    }
+
+    /// Longer text for the log.
+    var long: String {
+        switch self {
+        case .match(let g): return "Redump: matches “\(g)”"
+        case .partial(let g, let n, let total): return "Redump: \(n) of \(total) tracks match “\(g)”; the others differ (a bad or modified dump?)"
+        case .noMatch: return "Redump: no match in the loaded DAT files (a bad, modified or unlisted dump, or a different system's DAT)"
+        }
+    }
+
+    /// Hashes `tracks` and looks them up. `progress` gets 0…1 by bytes read.
+    static func check(tracks: [URL], index: RedumpIndex, progress: @escaping @Sendable (Double) -> Void) -> RedumpResult {
+        let total = max(totalSize(tracks), 1)
+        var done = 0.0
+        var hits: [String: Int] = [:]   // game → tracks matched
+        for t in tracks {
+            guard let sha1 = sha1Hex(of: t, onBytes: { done += $0; progress(min(done / total, 1)) }) else { continue }
+            // One file can appear in several games (e.g. a shared audio track); count it for each.
+            for g in Set((index.roms[sha1] ?? []).map(\.game)) { hits[g, default: 0] += 1 }
+        }
+        guard let (game, n) = hits.max(by: { $0.value < $1.value }) else { return .noMatch }
+        let expected = index.trackCount[game] ?? n
+        return n == tracks.count && n == expected ? .match(game) : .partial(game, n, expected)
+    }
+
+    /// SHA-1 of a file, read in 8 MB chunks. `onBytes` is told how much was read each time.
+    static func sha1Hex(of url: URL, onBytes: (Double) -> Void) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        var hasher = Insecure.SHA1()
+        while let chunk = try? h.read(upToCount: 8 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+            onBytes(Double(chunk.count))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// The DAT files you've added in Settings, and the combined index built from them.
+@MainActor
+final class RedumpDB: ObservableObject {
+    static let shared = RedumpDB()
+
+    struct DAT: Identifiable, Sendable { let url: URL; let games: Int; var id: String { url.path } }
+
+    @Published private(set) var dats: [DAT] = []
+    @Published private(set) var index = RedumpIndex()
+    @Published private(set) var isLoading = false
+    @Published var lastError: String?
+    /// Check dumps while converting (only when at least one DAT is loaded).
+    @Published var enabled: Bool { didSet { UserDefaults.standard.set(enabled, forKey: "redumpEnabled") } }
+    /// With "Move source files to Trash" on, keep the originals of dumps that don't match.
+    @Published var keepUnmatched: Bool { didSet { UserDefaults.standard.set(keepUnmatched, forKey: "redumpKeepUnmatched") } }
+
+    var active: Bool { enabled && !index.isEmpty }
+
+    private var paths: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "redumpDATs") ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: "redumpDATs") }
+    }
+
+    init() {
+        let d = UserDefaults.standard
+        enabled = d.object(forKey: "redumpEnabled") as? Bool ?? true
+        keepUnmatched = d.object(forKey: "redumpKeepUnmatched") as? Bool ?? true
+        reload()
+    }
+
+    func add(_ urls: [URL]) {
+        paths = Array(Set(paths + urls.map(\.path))).sorted()
+        reload()
+    }
+
+    func remove(_ dat: DAT) {
+        paths.removeAll { $0 == dat.url.path }
+        reload()
+    }
+
+    /// Reads every DAT on a background thread. A .zip (as redump.org serves them) is unpacked first.
+    func reload() {
+        let urls = paths.map { URL(fileURLWithPath: $0) }
+        isLoading = true
+        Task.detached {
+            var merged = RedumpIndex(), loaded: [DAT] = [], failed: [String] = []
+            for url in urls {
+                if let one = RedumpDB.load(url) {
+                    merged.merge(one); loaded.append(DAT(url: url, games: one.gameCount))
+                } else {
+                    failed.append(url.lastPathComponent)
+                }
+            }
+            let (m, l, f) = (merged, loaded, failed)
+            await MainActor.run {
+                self.index = m
+                self.dats = l
+                self.isLoading = false
+                self.lastError = f.isEmpty ? nil : "Couldn't read: \(f.joined(separator: ", ")). It may have moved, or isn't a Redump DAT."
+            }
+        }
+    }
+
+    nonisolated static func load(_ url: URL) -> RedumpIndex? {
+        if url.pathExtension.lowercased() == "zip" {
+            let fm = FileManager.default
+            let tmp = fm.temporaryDirectory.appendingPathComponent("converterator-dat-\(UUID().uuidString)")
+            defer { try? fm.removeItem(at: tmp) }
+            guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil,
+                  UpdateChecker.runTool("/usr/bin/ditto", ["-x", "-k", url.path, tmp.path]) == 0 else { return nil }
+            let dats = (fm.enumerator(at: tmp, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
+                .filter { ["dat", "xml"].contains($0.pathExtension.lowercased()) }
+            var merged = RedumpIndex(), any = false
+            for d in dats { if let data = try? Data(contentsOf: d), let i = RedumpIndex.parse(data) { merged.merge(i); any = true } }
+            return any ? merged : nil
+        }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return RedumpIndex.parse(data)
+    }
+}
+
+// MARK: - Clean up originals
+
+/// Finds source files that already have their CHDs (for folders converted with the Trash option off)
+/// and moves the ones you pick to the Trash, optionally after verifying each CHD.
+@MainActor
+final class Cleanup: ObservableObject {
+    static let shared = Cleanup()
+
+    struct Item: Identifiable, Sendable {
+        let id = UUID()
+        let source: URL          // what was converted: .cue/.gdi/.iso/.pbp/.zip/.7z
+        let files: [URL]         // what goes to the Trash: the source plus its track files
+        let bytes: Double
+        let chds: [URL]          // the CHDs that cover it
+        var include = true
+        var problem: String?     // set if its CHD failed verification
+    }
+
+    enum Phase: Equatable { case idle, scanning, review, working, done }
+
+    @Published var phase: Phase = .idle
+    @Published var folder: URL?
+    @Published var items: [Item] = []
+    @Published var verifyFirst = true
+    @Published var status = ""
+    @Published var progress = 0.0
+    @Published var summary = ""
+    /// Files left out because they share a CHD name with another file, so it's unclear which one the CHD came from.
+    @Published var ambiguous = 0
+    private var cancelled = false
+
+    var selected: [Item] { items.filter(\.include) }
+    var selectedBytes: Double { selected.reduce(0) { $0 + $1.bytes } }
+
+    func scan(_ folder: URL) {
+        self.folder = folder
+        phase = .scanning
+        items = []
+        status = "Looking for converted files…"
+        let outDir = Converter.shared.outputDir
+        let sevenZip = Converter.shared.sevenZip
+        Task.detached {
+            let found = Cleanup.findConverted(in: folder, outputDir: outDir, sevenZip: sevenZip)
+            // Two different originals pointing at the same CHD (e.g. many "Disc 1.cue" files and one shared
+            // Save to: folder) can't both be its source. Leave them all out rather than guess.
+            var uses: [String: Int] = [:]
+            for item in found { for chd in Set(item.chds.map(\.standardizedFileURL.path)) { uses[chd, default: 0] += 1 } }
+            let clear = found.filter { $0.chds.allSatisfy { uses[$0.standardizedFileURL.path] == 1 } }
+            let skipped = found.count - clear.count
+            await MainActor.run {
+                self.ambiguous = skipped
+                self.items = clear
+                self.phase = .review
+            }
+        }
+    }
+
+    func cancel() { cancelled = true }
+
+    /// Verifies (optionally) and trashes every included item. Items whose CHD fails stay put.
+    func run() {
+        let chosen = selected
+        guard !chosen.isEmpty else { return }
+        phase = .working
+        cancelled = false
+        progress = 0
+        Task {
+            var trashed = 0, trashedBytes = 0.0, kept = 0
+            let fm = FileManager.default
+            let chdman = Converter.shared.chdman
+            for (n, item) in chosen.enumerated() {
+                if cancelled { break }
+                status = "\(verifyFirst ? "Verifying and moving" : "Moving") \(n + 1) of \(chosen.count): \(item.source.lastPathComponent)"
+                progress = Double(n) / Double(chosen.count)
+                var ok = item.chds.allSatisfy { totalSize([$0]) > 0 }
+                if ok && verifyFirst, let chdman {
+                    for chd in item.chds {
+                        let base = progress, share = 1 / Double(chosen.count) / Double(item.chds.count)
+                        let good = await Cleanup.verify(chd, chdman: chdman) { p in
+                            Task { @MainActor in self.progress = base + share * p }
+                        }
+                        if !good { ok = false; break }
+                        if cancelled { break }
+                    }
+                }
+                if cancelled { break }
+                guard ok else {
+                    kept += 1
+                    if let i = items.firstIndex(where: { $0.id == item.id }) { items[i].problem = "CHD failed verification — kept" }
+                    continue
+                }
+                var failures: [String] = []
+                for f in item.files where fm.fileExists(atPath: f.path) {
+                    do { try fm.trashItem(at: f, resultingItemURL: nil) } catch { failures.append(f.lastPathComponent) }
+                }
+                if !failures.isEmpty {
+                    kept += 1
+                    if let i = items.firstIndex(where: { $0.id == item.id }) {
+                        items[i].problem = "Couldn't move \(failures.joined(separator: ", ")) to the Trash"
+                    }
+                    continue
+                }
+                trashed += 1
+                trashedBytes += item.bytes
+                items.removeAll { $0.id == item.id }
+            }
+            progress = 1
+            var parts = [trashed == 0 ? "Nothing was moved to the Trash."
+                         : "Moved \(trashed) item\(trashed == 1 ? "" : "s") (\(formatBytes(trashedBytes))) to the Trash."]
+            if kept > 0 { parts.append("Kept \(kept): see the red notes below.") }
+            if cancelled { parts.append("Stopped before the rest.") }
+            parts.append("You can put anything back from the Trash.")
+            summary = parts.joined(separator: " ")
+            phase = .done
+        }
+    }
+
+    // MARK: Matching
+
+    /// Every disc image (or archive of them) under `folder` whose CHDs all exist, next to it or in `outputDir`.
+    nonisolated static func findConverted(in folder: URL, outputDir: URL?, sevenZip: URL?) -> [Item] {
+        let fm = FileManager.default
+        var result: [Item] = []
+        let files = (fm.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
+            .allObjects as? [URL] ?? [])
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        for f in files {
+            let ext = f.pathExtension.lowercased()
+            let dirs = [f.deletingLastPathComponent()] + (outputDir.map { [$0] } ?? [])
+            var chds: [URL]?
+            var trash: [URL] = [f]
+            if Converter.inputExtensions.contains(ext) {
+                chds = covering(base: f.deletingPathExtension().lastPathComponent, isPBP: ext == "pbp", in: dirs)
+                trash = Converter.sourceFiles(for: f)
+            } else if Converter.archiveExtensions.contains(ext) {
+                let names = ext == "zip" ? Converter.zipEntryNames(f) : sevenZip.flatMap { sevenZipNames(f, tool: $0) }
+                let games = (names ?? []).filter { Converter.inputExtensions.contains(($0 as NSString).pathExtension.lowercased()) }
+                if !games.isEmpty {
+                    var all: [URL] = []
+                    for g in games {
+                        let name = (g as NSString).lastPathComponent
+                        guard let c = covering(base: (name as NSString).deletingPathExtension,
+                                               isPBP: (name as NSString).pathExtension.lowercased() == "pbp", in: dirs)
+                        else { all = []; break }
+                        all += c
+                    }
+                    if !all.isEmpty { chds = all }
+                }
+            }
+            if let chds, !chds.isEmpty {
+                result.append(Item(source: f, files: trash, bytes: totalSize(trash), chds: chds))
+            }
+        }
+        return result
+    }
+
+    /// The CHDs for one game: `base.chd`, or for a multi-disc PBP the CHDs its `base.m3u` lists.
+    /// Nil unless they all exist and aren't empty.
+    nonisolated static func covering(base: String, isPBP: Bool, in dirs: [URL]) -> [URL]? {
+        for dir in dirs {
+            let chd = dir.appendingPathComponent(base + ".chd")
+            if totalSize([chd]) > 0 { return [chd] }
+        }
+        guard isPBP else { return nil }
+        for dir in dirs {
+            let m3u = dir.appendingPathComponent(base + ".m3u")
+            guard let text = try? String(contentsOf: m3u, encoding: .utf8) else { continue }
+            let listed = text.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+                .map { dir.appendingPathComponent($0) }
+            if !listed.isEmpty, listed.allSatisfy({ $0.pathExtension.lowercased() == "chd" && totalSize([$0]) > 0 }) {
+                return listed
+            }
+        }
+        return nil
+    }
+
+    /// File names inside a .7z, from `7zz l`.
+    nonisolated static func sevenZipNames(_ url: URL, tool: URL) -> [String]? {
+        let p = Process()
+        p.executableURL = tool
+        p.arguments = ["l", "-ba", "-slt", url.path]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        return out.split(separator: "\n").filter { $0.hasPrefix("Path = ") }.map { String($0.dropFirst(7)) }
+    }
+
+    /// Runs `chdman verify`, reporting progress; stops it if it makes no progress for the stall timeout.
+    nonisolated static func verify(_ chd: URL, chdman: URL, progress: @escaping @Sendable (Double) -> Void) async -> Bool {
+        final class State: @unchecked Sendable {
+            let lock = NSLock(); var last = Date(); var pct = -1.0
+            func saw(_ p: Double) { lock.lock(); if p != pct { pct = p; last = Date() }; lock.unlock() }
+            var idle: TimeInterval { lock.lock(); defer { lock.unlock() }; return Date().timeIntervalSince(last) }
+        }
+        let state = State()
+        let p = Process()
+        p.executableURL = chdman
+        p.arguments = ["verify", "-i", chd.path]
+        p.environment = Converter.toolEnvironment
+        p.standardInput = FileHandle.nullDevice
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        let buffer = LineBuffer { line in
+            if let r = line.range(of: #"([0-9.]+)% complete"#, options: .regularExpression),
+               let pct = Double(line[r].split(separator: "%")[0]) {
+                state.saw(pct); progress(pct / 100)
+            }
+        }
+        let stall = await MainActor.run { Converter.stallTimeout }
+        let watchdog = Task.detached {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(min(5, stall / 2)))
+                if state.idle > stall { p.terminate(); break }
+            }
+        }
+        defer { watchdog.cancel() }
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            pipe.fileHandleForReading.readabilityHandler = { h in
+                let d = h.availableData
+                if d.isEmpty { h.readabilityHandler = nil } else { buffer.feed(d) }
+            }
+            p.terminationHandler = { proc in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                cont.resume(returning: proc.terminationReason == .exit && proc.terminationStatus == 0)
+            }
+            do { try p.run() } catch {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                cont.resume(returning: false)
+            }
+        }
+    }
+}
+
+struct CleanupView: View {
+    @ObservedObject private var m = Cleanup.shared
+    @ObservedObject private var c = Converter.shared
+    @State private var confirm = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Find disc images that already have their CHDs, and move them to the Trash.")
+                .foregroundStyle(.secondary)
+            HStack {
+                Text(m.folder?.path(percentEncoded: false) ?? "No folder chosen")
+                    .lineLimit(1).truncationMode(.head)
+                    .foregroundStyle(m.folder == nil ? .secondary : .primary)
+                Spacer()
+                Button("Choose Folder…", action: chooseFolder)
+                    .disabled(m.phase == .scanning || m.phase == .working)
+            }
+            Divider()
+            content.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding(16)
+        .frame(minWidth: 560, minHeight: 420)
+        .alert("Move \(m.selected.count) item\(m.selected.count == 1 ? "" : "s") (\(formatBytes(m.selectedBytes))) to the Trash?",
+               isPresented: $confirm) {
+            Button("Move to Trash", role: .destructive) { m.run() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(m.verifyFirst
+                 ? "Each CHD is verified first. Anything whose CHD fails is kept. You can put files back from the Trash."
+                 : "You can put them back from the Trash.")
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch m.phase {
+        case .idle:
+            Text("Choose a folder to look in. Subfolders are included. A file counts as converted when its CHD (or, for a multi-disc PBP, every CHD in its .m3u) is next to it\(c.outputDir == nil ? "" : " or in your Save to: folder").")
+                .foregroundStyle(.secondary)
+        case .scanning:
+            HStack { ProgressView().controlSize(.small); Text(m.status) }
+        case .review:
+            if m.items.isEmpty {
+                Text("Nothing to clean up: no disc images here have a matching CHD.").foregroundStyle(.secondary)
+            } else {
+                review
+            }
+        case .working:
+            VStack(alignment: .leading, spacing: 8) {
+                Text(m.status).lineLimit(1).truncationMode(.middle)
+                ProgressView(value: m.progress)
+                Button("Stop") { m.cancel() }
+            }
+        case .done:
+            VStack(alignment: .leading, spacing: 8) {
+                Text(m.summary)
+                if !m.items.isEmpty { review }
+            }
+        }
+    }
+
+    private var review: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if m.ambiguous > 0 {
+                Text("\(m.ambiguous) more left out: they share a CHD name with another file, so it's unclear which one the CHD was made from.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Text("\(m.items.count) converted item\(m.items.count == 1 ? "" : "s") found. \(m.selected.count) selected, \(formatBytes(m.selectedBytes)).")
+                Spacer()
+                Button("Select All") { for i in m.items.indices { m.items[i].include = true } }
+                Button("Select None") { for i in m.items.indices { m.items[i].include = false } }
+            }
+            .font(.callout)
+            List {
+                ForEach($m.items) { $item in
+                    Toggle(isOn: $item.include) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.source.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                            Text(itemDetail(item)).font(.caption)
+                                .foregroundStyle(item.problem == nil ? Color.secondary : Color.red)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                    }
+                    .contextMenu {
+                        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.source]) }
+                        Button("Show CHD in Finder") { NSWorkspace.shared.activateFileViewerSelecting(item.chds) }
+                    }
+                }
+            }
+            HStack {
+                Toggle("Verify each CHD before moving its originals", isOn: $m.verifyFirst)
+                Spacer()
+                Button("Move to Trash…") { confirm = true }
+                    .disabled(m.selected.isEmpty || c.isRunning || (m.verifyFirst && c.chdman == nil))
+                    .keyboardShortcut(.defaultAction)
+            }
+            if c.isRunning {
+                Text("Wait for the current batch to finish before cleaning up.").font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func itemDetail(_ item: Cleanup.Item) -> String {
+        if let p = item.problem { return p }
+        let extra = item.files.count - 1
+        let files = extra > 0 ? " + \(extra) track file\(extra == 1 ? "" : "s")" : ""
+        let chd = item.chds.count == 1 ? item.chds[0].lastPathComponent : "\(item.chds.count) CHDs"
+        return "\(formatBytes(item.bytes))\(files) · converted to \(chd)"
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.prompt = "Look Here"
+        panel.message = "Choose a folder to look for disc images that already have CHDs"
+        let window = NSApp.keyWindow
+        let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK, let url = panel.url { m.scan(url) } }
+        if let window { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
     }
 }
 
@@ -1566,6 +2141,24 @@ struct ContentView: View {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // "Convert with Converterator" in Finder's right-click menu (declared as NSServices in Info.plist).
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
+    }
+
+    /// The Finder service: adds the selected files and folders, and starts converting if that's turned on.
+    @objc func convertFiles(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        MainActor.assumeIsolated {
+            let c = Converter.shared
+            c.add(urls)
+            NSApp.activate(ignoringOtherApps: true)
+            if c.startFromFinder && !c.isRunning && c.toolsReady && c.hasQueued { c.start() }
+        }
+    }
+
     /// Files dropped on the Dock icon or opened with "Open With → Converterator".
     func application(_ application: NSApplication, open urls: [URL]) {
         MainActor.assumeIsolated { Converter.shared.add(urls) }
@@ -1579,6 +2172,9 @@ struct ConverteratorApp: App {
         Window("Converterator", id: "main") { ContentView() }
             .defaultSize(width: 640, height: 520)
             .commands { AppCommands() }
+        Window("Clean Up Originals", id: "cleanup") { CleanupView() }
+            .defaultSize(width: 640, height: 520)
+        Settings { SettingsView() }
     }
 }
 
@@ -1592,6 +2188,7 @@ extension Notification.Name {
 /// Menu bar items and their keyboard shortcuts.
 struct AppCommands: Commands {
     @ObservedObject private var c = Converter.shared
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
@@ -1601,6 +2198,8 @@ struct AppCommands: Commands {
             Button("Add Files…") { NotificationCenter.default.post(name: .addFiles, object: nil) }
                 .keyboardShortcut("o")
                 .disabled(c.isRunning)
+            Divider()
+            Button("Clean Up Originals…") { openWindow(id: "cleanup") }
         }
         CommandMenu("Convert") {
             Button("Convert") { c.start() }
@@ -1624,5 +2223,59 @@ struct AppCommands: Commands {
             Button("Show or Hide Log") { NotificationCenter.default.post(name: .toggleLog, object: nil) }
                 .keyboardShortcut("l")
         }
+    }
+}
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @ObservedObject private var c = Converter.shared
+    @ObservedObject private var redump = RedumpDB.shared
+
+    var body: some View {
+        Form {
+            Section("Finder") {
+                Toggle("Start converting right away", isOn: $c.startFromFinder)
+                Text("For files sent with Convert with Converterator in Finder's right-click menu (under Quick Actions or Services). Turned off, they're just added to the list.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Redump") {
+                Text("Redump lists the checksums of known good disc dumps. Add its DAT files (one per system, free from redump.org) to check each BIN/CUE, GDI or ISO before converting it. PBPs can't be checked.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if redump.dats.isEmpty && !redump.isLoading {
+                    Text("No DAT files added.").foregroundStyle(.secondary)
+                }
+                ForEach(redump.dats) { dat in
+                    HStack {
+                        Text(dat.url.deletingPathExtension().lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Text("\(dat.games) games").foregroundStyle(.secondary).monospacedDigit()
+                        Button("Remove") { redump.remove(dat) }
+                    }
+                }
+                if redump.isLoading { HStack { ProgressView().controlSize(.small); Text("Reading DAT files…") } }
+                if let err = redump.lastError { Text(err).font(.caption).foregroundStyle(.orange) }
+                HStack {
+                    Button("Add DAT Files…", action: addDATs)
+                    Link("Get DAT files from redump.org", destination: URL(string: "http://redump.org/downloads/")!)
+                }
+                Toggle("Check dumps while converting", isOn: $redump.enabled)
+                    .disabled(redump.dats.isEmpty)
+                Toggle("With “Move source files to Trash” on, keep the originals of dumps that don't match", isOn: $redump.keepUnmatched)
+                    .disabled(redump.dats.isEmpty)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 520)
+        .frame(minHeight: 420)
+    }
+
+    private func addDATs() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = ["dat", "xml", "zip"].compactMap { UTType(filenameExtension: $0) }
+        panel.message = "Choose Redump DAT files (.dat, or the .zip they're downloaded as)"
+        let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK { redump.add(panel.urls) } }
+        if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
     }
 }

@@ -67,8 +67,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.7.0</string>
-  <key>CFBundleVersion</key><string>12</string>
+  <key>CFBundleShortVersionString</key><string>1.8.0</string>
+  <key>CFBundleVersion</key><string>13</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
@@ -81,6 +81,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>
       <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string></array>
+    </dict>
+  </array>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Convert with Converterator</string></dict>
+      <key>NSMessage</key><string>convertFiles</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key>
+      <array><string>public.folder</string><string>public.data</string></array>
     </dict>
   </array>
 </dict>
