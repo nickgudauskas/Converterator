@@ -67,8 +67,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.8.1</string>
-  <key>CFBundleVersion</key><string>14</string>
+  <key>CFBundleShortVersionString</key><string>1.9.0</string>
+  <key>CFBundleVersion</key><string>15</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
@@ -83,6 +83,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
       <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string></array>
     </dict>
   </array>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <!-- redump.org only serves plain HTTP; allow it for that one site, for downloading DAT files. -->
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>redump.org</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+    </dict>
+  </dict>
   <key>NSServices</key>
   <array>
     <dict>
