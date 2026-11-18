@@ -31,7 +31,7 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 
 ## Download
 
-Get `Converterator.zip` from the [latest release](https://github.com/nickgudauskas/Converterator/releases/latest), unzip it, and move **Converterator.app** to your Applications folder. Release builds are for **Apple Silicon** Macs. On an Intel Mac, [build it yourself](#building).
+Get `Converterator.zip` from the [latest release](https://github.com/nickgudauskas/Converterator/releases/latest), unzip it, and move **Converterator.app** to your Applications folder. The app is **universal**: the same download runs natively on both Apple Silicon and Intel Macs.
 
 The app is free and not notarized by Apple, so macOS blocks it the first time you open it. To allow it:
 
@@ -71,7 +71,7 @@ cd Converterator
 ./build.sh
 ```
 
-The first build downloads PSXPackager v1.8.0 from its GitHub releases into `vendor/` and bundles it inside the app. The result is `Converterator.app` in the same folder. Move it to `/Applications` to install it.
+The first build downloads PSXPackager v1.8.0 (the Apple Silicon and Intel builds) from its GitHub releases into `vendor/`. The script compiles the app for both architectures, merges them with `lipo` into one universal app, and bundles both PSXPackager builds. The app uses the one that matches the Mac it's running on. (PSXPackager is a .NET single-file app and can't be merged with `lipo`.) The result is `Converterator.app` in the same folder. Move it to `/Applications` to install it. You can build on either kind of Mac.
 
 The app is ad-hoc signed and not notarized. Copies moved to other Macs need the same **Open Anyway** step described under [Download](#download).
 

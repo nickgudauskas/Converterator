@@ -5,36 +5,46 @@ cd "${0:A:h}"
 
 APP="Converterator.app"
 PSX_VERSION="v1.8.0"
-case "$(uname -m)" in
-  arm64) ARCH=arm64; PSX_PLATFORM=osx-arm64 ;;
-  *)     ARCH=x86_64; PSX_PLATFORM=osx-x64 ;;
-esac
 
-# PSXPackager isn't stored in this repo; fetch the release build once into vendor/.
-if [[ ! -x vendor/psxpackager/psxpackager ]]; then
-  echo "Downloading PSXPackager $PSX_VERSION ($PSX_PLATFORM)…"
-  mkdir -p vendor
-  curl -fsSL -o vendor/psxpackager.tar.gz \
-    "https://github.com/RupertAvery/PSXPackager/releases/download/$PSX_VERSION/psxpackager-$PSX_PLATFORM.tar.gz"
-  tar -xzf vendor/psxpackager.tar.gz -C vendor
-  rm -rf vendor/psxpackager
-  mv "vendor/psxpackager-$PSX_PLATFORM" vendor/psxpackager
-  rm -f vendor/psxpackager.tar.gz vendor/psxpackager/README.md
-fi
+# PSXPackager isn't stored in this repo; fetch both macOS release builds once into vendor/.
+# It's a .NET single-file app, which can't be merged with lipo, so the app carries one per CPU.
+fetch_psx() {   # $1 = release platform (osx-arm64 / osx-x64)
+  if [[ ! -x "vendor/$1/psxpackager" ]]; then
+    echo "Downloading PSXPackager $PSX_VERSION ($1)…"
+    mkdir -p vendor
+    curl -fsSL -o "vendor/$1.tar.gz" \
+      "https://github.com/RupertAvery/PSXPackager/releases/download/$PSX_VERSION/psxpackager-$1.tar.gz"
+    tar -xzf "vendor/$1.tar.gz" -C vendor
+    rm -rf "vendor/$1"
+    mv "vendor/psxpackager-$1" "vendor/$1"
+    rm -f "vendor/$1.tar.gz"
+  fi
+}
+fetch_psx osx-arm64
+fetch_psx osx-x64
 # PSXPackager is MIT-licensed; its license must travel with the copy bundled in the app.
-if [[ ! -f vendor/psxpackager/LICENSE ]]; then
-  curl -fsSL -o vendor/psxpackager/LICENSE \
+if [[ ! -f vendor/LICENSE-psxpackager ]]; then
+  curl -fsSL -o vendor/LICENSE-psxpackager \
     "https://raw.githubusercontent.com/RupertAvery/PSXPackager/$PSX_VERSION/LICENSE"
 fi
 
 rm -rf "$APP" build
-mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources/psxpackager"
 
-swiftc -parse-as-library -swift-version 5 -O \
-  -target "$ARCH-apple-macos14" \
-  main.swift -o "$APP/Contents/MacOS/Converterator"
+# Universal app: compile each architecture, then merge them with lipo.
+for ARCH in arm64 x86_64; do
+  swiftc -parse-as-library -swift-version 5 -O \
+    -target "$ARCH-apple-macos14" \
+    main.swift -o "build/Converterator-$ARCH"
+done
+lipo -create build/Converterator-arm64 build/Converterator-x86_64 \
+  -output "$APP/Contents/MacOS/Converterator"
 
-cp -R vendor/psxpackager "$APP/Contents/Resources/psxpackager"
+PSX="$APP/Contents/Resources/psxpackager"
+cp vendor/osx-arm64/psxpackager "$PSX/psxpackager-arm64"
+cp vendor/osx-x64/psxpackager "$PSX/psxpackager-x86_64"
+cp -R vendor/osx-arm64/Resources "$PSX/Resources"   # identical in both builds
+cp vendor/LICENSE-psxpackager "$PSX/LICENSE"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 
 # Optional custom icon: drop an icon.icns next to this script.
@@ -50,8 +60,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
+  <key>CFBundleVersion</key><string>3</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>

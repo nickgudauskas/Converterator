@@ -81,9 +81,20 @@ final class Converter: ObservableObject {
 
     // MARK: Tools
 
+    /// CPU architecture of the running app slice, matching the bundled tool suffixes.
+    static let arch: String = {
+        #if arch(arm64)
+        return "arm64"
+        #else
+        return "x86_64"
+        #endif
+    }()
+
     static func findTool(_ name: String) -> URL? {
         var candidates: [String] = []
         if let res = Bundle.main.resourceURL {
+            // Universal builds bundle one copy per architecture, e.g. psxpackager/psxpackager-x86_64.
+            candidates.append(res.appendingPathComponent("psxpackager/\(name)-\(arch)").path)
             candidates.append(res.appendingPathComponent("psxpackager/\(name)").path)
             candidates.append(res.appendingPathComponent(name).path)
         }
