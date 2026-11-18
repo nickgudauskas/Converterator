@@ -510,6 +510,12 @@ struct ContentView: View {
         .disabled(c.isRunning)
     }
 
+    /// "Version 1.2.2" from the app's Info.plist (set in build.sh).
+    static let versionLabel: String = {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        return v.map { "Version \($0)" } ?? ""
+    }()
+
     private var bottomBar: some View {
         HStack {
             Button("Add Files…", action: pickFiles).disabled(c.isRunning)
@@ -522,6 +528,11 @@ struct ContentView: View {
             .disabled(c.isRunning || c.jobs.isEmpty)
             Toggle("Show Log", isOn: $showLog).toggleStyle(.button)
             Spacer()
+            Text(Self.versionLabel)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+                .padding(.trailing, 6)
             if c.isRunning {
                 Button("Cancel", role: .cancel, action: c.cancel)
             } else {
