@@ -33,16 +33,7 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 
 Get `Converterator.zip` from the [latest release](https://github.com/nickgudauskas/Converterator/releases/latest), unzip it, and move **Converterator.app** to your Applications folder. The app is **universal**: the same download runs natively on both Apple Silicon and Intel Macs.
 
-The app is free and not notarized by Apple, so macOS blocks it the first time you open it. To allow it:
-
-1. Open Converterator once and dismiss the warning.
-2. Go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to Converterator.
-
-If PBP conversion still fails after that, clear the download flag in Terminal:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Converterator.app
-```
+Release builds from 1.2.1 on are signed with a Developer ID and **notarized by Apple**, so they open with a normal double-click. (Releases 1.0–1.2.0 weren't notarized and needed **System Settings → Privacy & Security → Open Anyway** the first time.)
 
 You still need to install `chdman` (and .NET for PBPs). See the requirements below.
 
@@ -73,7 +64,29 @@ cd Converterator
 
 The first build downloads PSXPackager v1.8.0 (the Apple Silicon and Intel builds) from its GitHub releases into `vendor/`. The script compiles the app for both architectures, merges them with `lipo` into one universal app, and bundles both PSXPackager builds. The app uses the one that matches the Mac it's running on. (PSXPackager is a .NET single-file app and can't be merged with `lipo`.) The result is `Converterator.app` in the same folder. Move it to `/Applications` to install it. You can build on either kind of Mac.
 
-The app is ad-hoc signed and not notarized. Copies moved to other Macs need the same **Open Anyway** step described under [Download](#download).
+`./build.sh` signs the app ad-hoc, which is fine on your own Mac. A copy moved to another Mac would be blocked by Gatekeeper until allowed with **System Settings → Privacy & Security → Open Anyway**.
+
+### Signing and notarizing a release
+
+You need an Apple Developer account with a **Developer ID Application** certificate in your Keychain. Save your notarization login once (it asks for an [app-specific password](https://account.apple.com)):
+
+```bash
+xcrun notarytool store-credentials converterator-notary --apple-id YOUR_APPLE_ID --team-id YOUR_TEAM_ID
+```
+
+Then run:
+
+```bash
+./notarize.sh
+```
+
+The script:
+1. builds and signs every executable with your Developer ID, hardened runtime, and a secure timestamp. PSXPackager also gets the .NET permissions listed in `psxpackager.entitlements`.
+2. submits the app to Apple.
+3. staples Apple's ticket to the app.
+4. writes `dist/Converterator.zip`, ready to upload.
+
+To use a profile with a different name, set `NOTARY_PROFILE`.
 
 ### Changing the icon
 
@@ -91,6 +104,8 @@ iconutil -c icns AppIcon.iconset -o icon.icns && rm -rf AppIcon.iconset
 |---|---|
 | `main.swift` | The whole app: SwiftUI interface, the conversion queue, and running PSXPackager and `chdman`. |
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
+| `notarize.sh` | Builds with Developer ID signing, notarizes with Apple, staples, and zips into `dist/`. |
+| `psxpackager.entitlements` | Hardened-runtime permissions the bundled .NET PSXPackager needs. |
 | `make_icon.swift` | Draws the app icon. |
 | `icon.icns`, `icon-preview.png` | The generated icon. |
 
