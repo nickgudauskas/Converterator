@@ -9,7 +9,13 @@ A small native macOS app for turning PlayStation-era disc images into compressed
 
 Drop files or whole folders in, click **Convert**, and you're done.
 
-<p align="center"><img src="docs/screenshot.png" width="640" alt="Converterator window with five disc images queued for conversion"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">
+    <img src="docs/screenshot-light.png" width="640" alt="Converterator window with five disc images queued for conversion">
+  </picture>
+</p>
 
 ## What it converts
 
