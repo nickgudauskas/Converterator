@@ -177,17 +177,18 @@ final class Converter: ObservableObject {
     // MARK: Queue
 
     /// Inputs found when scanning folders. .pbp goes through PSXPackager first; the rest go straight to chdman.
-    static let inputExtensions: Set<String> = ["pbp", "cue", "gdi", "iso"]
+    nonisolated static let inputExtensions: Set<String> = ["pbp", "cue", "gdi", "iso"]
     /// .chd files are extracted back to BIN/CUE, GDI or ISO. Only when added one by one: a folder scan
     /// never picks them up, so re-adding a converted folder doesn't unpack every CHD in it.
-    static let extractExtensions: Set<String> = ["chd"]
+    nonisolated static let extractExtensions: Set<String> = ["chd"]
 
     func add(_ urls: [URL]) {
         let fm = FileManager.default
         var found: [URL] = []
         func consider(_ f: URL) {
             let ext = f.pathExtension.lowercased()
-            if Converter.inputExtensions.contains(ext) || Converter.extractExtensions.contains(ext) {
+            if Converter.inputExtensions.contains(ext) || Converter.extractExtensions.contains(ext)
+                || Converter.archiveExtensions.contains(ext) {
                 found.append(f)
             } else if ext == "bin" {
                 // A dropped .bin means its .cue sheet (same name); folder scans pick up the .cue directly.
@@ -202,7 +203,12 @@ final class Converter: ObservableObject {
             if isDir.boolValue {
                 let e = fm.enumerator(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
                 while let f = e?.nextObject() as? URL {
-                    if Converter.inputExtensions.contains(f.pathExtension.lowercased()) { found.append(f) }
+                    let ext = f.pathExtension.lowercased()
+                    if Converter.inputExtensions.contains(ext) {
+                        found.append(f)
+                    } else if Converter.archiveExtensions.contains(ext), archiveHasDiscImage(f) {
+                        found.append(f)   // only archives with a disc image inside, not zipped cartridge games
+                    }
                 }
             } else {
                 consider(url)
@@ -215,11 +221,15 @@ final class Converter: ObservableObject {
         let newJobs = new.map { url -> Job in
             var job = Job(url: url)
             job.weight = max(totalSize(Converter.sourceFiles(for: url)), 1)
+            // Flag a .cue/.gdi with missing tracks now, rather than partway through a batch.
+            let missing = Converter.missingTracks(for: url)
+            if !missing.isEmpty { job.state = .failed; job.detail = Converter.describeMissing(missing); job.timed = false }
             return job
         }
         jobs += newJobs
-        if isRunning { batchIDs += newJobs.map(\.id) }   // files added mid-run join the current batch
-        if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso or .chd files found in what was added.") }
+        // Files added mid-run join the current batch.
+        if isRunning { batchIDs += newJobs.filter { $0.state == .queued }.map(\.id) }
+        if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso, .chd, .zip or .7z files found in what was added.") }
     }
 
     func clearFinished() { jobs.removeAll { $0.state == .done || $0.state == .failed } }
@@ -355,145 +365,80 @@ final class Converter: ObservableObject {
         if let i = jobs.firstIndex(where: { $0.id == id }) { change(&jobs[i]) }
     }
 
+    /// What compressGame produced for one game (one .pbp/.cue/.gdi/.iso).
+    private struct GameResult {
+        var made: [URL] = []
+        var skipped = 0                 // CHDs that already existed and weren't rewritten
+        var bytesIn = 0.0, bytesOut = 0.0
+    }
+
     private func convert(index: Int) async {
         let job = jobs[index]
         let id = job.id
         let fm = FileManager.default
         let src = job.url
-        let base = src.deletingPathExtension().lastPathComponent
         let outDir = outputDir ?? src.deletingLastPathComponent()
-        let tmp = fm.temporaryDirectory.appendingPathComponent("pbp2chd-\(UUID().uuidString)", isDirectory: true)
+        let isArchive = Converter.archiveExtensions.contains(src.pathExtension.lowercased())
 
         func fail(_ msg: String) {
             update(id) { $0.state = .failed; $0.detail = msg; $0.progress = nil; $0.timed = false }
             append("✗ \(src.lastPathComponent): \(msg)")
         }
 
-        let isPBP = src.pathExtension.lowercased() == "pbp"
-        update(id) { $0.state = .working; $0.detail = isPBP ? "Extracting BIN/CUE…" : "Starting…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
-        // For the batch bar, PBP extraction counts as the first 20% of the job, compression the rest.
-        let compressStart = isPBP ? 0.2 : 0.0
+        update(id) { $0.state = .working; $0.detail = "Starting…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
         append("▶ \(src.lastPathComponent)")
+        do { try fm.createDirectory(at: outDir, withIntermediateDirectories: true) }
+        catch { return fail("Can't create folder: \(error.localizedDescription)") }
 
-        do {
-            try fm.createDirectory(at: outDir, withIntermediateDirectories: true)
-            if isPBP { try fm.createDirectory(at: tmp, withIntermediateDirectories: true) }
-        } catch { return fail("Can't create folder: \(error.localizedDescription)") }
-        defer { if isPBP { try? fm.removeItem(at: tmp) } }
-
-        // Step 1 (PBP only): PBP → BIN/CUE in a temp folder. CUE/GDI/ISO inputs go straight to chdman.
-        var cues = [src]
-        if isPBP {
-            guard let psxpackager else { return fail("PSXPackager is missing from the app, so .pbp files can't be converted") }
-            let s1 = await run(psxpackager, ["-i", src.path, "-o", tmp.path, "-x", "-v", "2"]) { [weak self] line in
-                self?.append("  [psxpackager] \(line)")
-            }
+        // The games to compress: the file itself, or every disc image inside a .zip/.7z.
+        var games = [src]
+        var span = (start: 0.0, end: 1.0)
+        let unpacked = fm.temporaryDirectory.appendingPathComponent("converterator-\(UUID().uuidString)", isDirectory: true)
+        defer { if isArchive { try? fm.removeItem(at: unpacked) } }
+        if isArchive {
+            update(id) { $0.detail = "Unpacking \(src.pathExtension.lowercased())…" }
+            if let err = await unpackArchive(src, to: unpacked) { return fail(err) }
             if cancelRequested { return fail("Cancelled") }
-            cues = (fm.enumerator(at: tmp, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
-                .filter { $0.pathExtension.lowercased() == "cue" }
-                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            guard s1 == 0 || !cues.isEmpty else { return fail("PSXPackager failed (exit \(s1)) — see log") }
-            guard !cues.isEmpty else { return fail("PSXPackager produced no .cue file — see log") }
-            update(id) { $0.fraction = compressStart }
-        }
-        let discCount = Double(cues.count)
-        func jobFraction(disc n: Int, discProgress p: Double) -> Double {
-            compressStart + (1 - compressStart) * (Double(n) + p) / discCount
+            games = Converter.gamesInFolder(unpacked)
+            guard !games.isEmpty else { return fail("No .pbp, .cue, .gdi or .iso inside the archive") }
+            append("  found \(games.map(\.lastPathComponent).joined(separator: ", "))")
+            span = (0.1, 1.0)   // unpacking counts as the first 10%
+            update(id) { $0.fraction = 0.1 }
         }
 
-        // Step 2: BIN/CUE → CHD, one per disc
-        var made: [URL] = []
-        var allNewlyCreated = true   // false if any CHD was skipped because it already existed
-        var skippedCount = 0
-        var bytesIn = 0.0, bytesOut = 0.0
-        // With Verify on, each disc's share of the job is 75% compressing, 25% verifying.
-        let verifyShare = verify ? 0.25 : 0.0
-        for (n, cue) in cues.enumerated() {
-            let name = cues.count == 1 ? base : cue.deletingPathExtension().lastPathComponent
-            let out = outDir.appendingPathComponent(name + ".chd")
-            let disc = cues.count == 1 ? "" : " disc \(n + 1) of \(cues.count)"
-            var wroteThisDisc = false
-
-            if fm.fileExists(atPath: out.path) && !overwrite {
-                append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
-                made.append(out)
-                allNewlyCreated = false
-                skippedCount += 1
-                update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1 - verifyShare) }
-            } else {
-                // .iso: CD or DVD. Everything else (.cue, .gdi, and PBP extractions) is a CD.
-                var command = "createcd"
-                if cue.pathExtension.lowercased() == "iso" {
-                    let dvd: Bool
-                    switch isoMode {
-                    case .cd: dvd = false
-                    case .dvd: dvd = true
-                    case .automatic:
-                        let (isDVD, why) = Converter.isoLooksLikeDVD(cue)
-                        dvd = isDVD
-                        append("  \(isDVD ? "DVD" : "CD") image: \(why)")
-                    }
-                    if dvd { command = "createdvd" }
-                }
-                let label = "Compressing\(disc) to CHD"
-                var args = [command, "-i", cue.path, "-o", out.path]
-                if overwrite { args.append("-f") }
-                let s2 = await runChdman(args, id: id, label: label) { jobFraction(disc: n, discProgress: $0 * (1 - verifyShare)) }
-                if s2 != 0 || cancelRequested {
-                    try? fm.removeItem(at: out)
-                    return fail(cancelRequested ? "Cancelled" : Converter.chdmanFailure(s2))
-                }
-                made.append(out)
-                // A PBP's size is shared between its discs; a CUE/GDI/ISO counts its own track files.
-                bytesIn += isPBP ? totalSize([src]) / discCount : totalSize(Converter.sourceFiles(for: cue))
-                bytesOut += totalSize([out])
-                wroteThisDisc = true
-            }
-
-            // Optional: check the CHD's checksums, including CHDs that already existed.
-            if verify {
-                let s3 = await runChdman(["verify", "-i", out.path], id: id, label: "Verifying\(disc)") {
-                    jobFraction(disc: n, discProgress: 1 - verifyShare + $0 * verifyShare)
-                }
-                if cancelRequested { return fail("Cancelled") }
-                if s3 != 0 {
-                    // Delete a CHD we just wrote; leave one that was already there for the user to look at.
-                    if wroteThisDisc { try? fm.removeItem(at: out) }
-                    let why = s3 == Converter.stalledStatus ? "chdman stopped responding" : "see log"
-                    return fail("\(out.lastPathComponent) failed verification\(wroteThisDisc ? " and was deleted" : "") — \(why)")
-                }
-                append("  verified \(out.lastPathComponent)")
-            }
+        var total = GameResult()
+        for (i, game) in games.enumerated() {
+            let w = (span.end - span.start) / Double(games.count)
+            let start = span.start + w * Double(i)
+            guard let r = await compressGame(game, id: id, outDir: outDir, span: (start, start + w),
+                                             fail: { fail(games.count > 1 ? "\(game.lastPathComponent): \($0)" : $0) })
+            else { return }
+            total.made += r.made; total.skipped += r.skipped
+            total.bytesIn += r.bytesIn; total.bytesOut += r.bytesOut
         }
+        // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
+        if isArchive && total.bytesOut > 0 { total.bytesIn = totalSize([src]) }
 
-        // Multi-disc playlist
-        if made.count > 1 && makeM3U {
-            let m3u = outDir.appendingPathComponent(base + ".m3u")
-            let body = made.map { $0.lastPathComponent }.joined(separator: "\n") + "\n"
-            do { try body.write(to: m3u, atomically: true, encoding: .utf8); append("  wrote \(m3u.lastPathComponent)") }
-            catch { append("  couldn't write \(m3u.lastPathComponent): \(error.localizedDescription)") }
-        }
-
-        var summary = made.count == 1 ? made[0].lastPathComponent : "\(made.count) discs → CHD"
-        if skippedCount == made.count {
+        let made = total.made
+        var summary = made.count == 1 ? made[0].lastPathComponent : "\(made.count) CHDs"
+        if total.skipped == made.count {
             summary += " · already existed"
         } else {
-            summary += " · " + Converter.describeSaving(input: bytesIn, output: bytesOut)
+            summary += " · " + Converter.describeSaving(input: total.bytesIn, output: total.bytesOut)
         }
         if verify { summary += " · verified" }
 
         // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
         if trashSources {
-            let outputsOK = made.allSatisfy {
-                ((try? fm.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0) > 0
-            }
-            if !allNewlyCreated {
+            let outputsOK = made.allSatisfy { totalSize([$0]) > 0 }
+            if total.skipped > 0 {
                 append("  Kept source files: a CHD already existed and wasn't rewritten.")
             } else if !outputsOK {
                 append("  Kept source files: a CHD looks empty or missing.")
             } else {
                 var trashed = 0
-                for f in Converter.sourceFiles(for: src) {
+                // An archive goes to the Trash as a whole; its unpacked copy is temporary anyway.
+                for f in isArchive ? [src] : Converter.sourceFiles(for: src) {
                     do { try fm.trashItem(at: f, resultingItemURL: nil); trashed += 1 }
                     catch { append("  couldn't move \(f.lastPathComponent) to Trash: \(error.localizedDescription)") }
                 }
@@ -504,12 +449,221 @@ final class Converter: ObservableObject {
 
         // If every CHD already existed (and wasn't verified), this job took no real time:
         // keep it out of the speed estimate.
-        let didWork = made.count > 0 && (made.count != skippedCount || verify)
+        let didWork = made.count > 0 && (made.count != total.skipped || verify || isArchive)
         update(id) {
             $0.state = .done; $0.detail = summary; $0.progress = nil; $0.timed = didWork
-            $0.bytesIn = bytesIn; $0.bytesOut = bytesOut
+            $0.bytesIn = total.bytesIn; $0.bytesOut = total.bytesOut
         }
         append("✓ \(summary)")
+    }
+
+    /// Compresses one game (.pbp, .cue, .gdi or .iso) to one CHD per disc, plus an .m3u for
+    /// multi-disc games. Progress goes into `span` of the job's 0…1. Returns nil after calling `fail`.
+    private func compressGame(_ src: URL, id: UUID, outDir: URL, span: (Double, Double),
+                              fail: (String) -> Void) async -> GameResult? {
+        let fm = FileManager.default
+        let base = src.deletingPathExtension().lastPathComponent
+        let isPBP = src.pathExtension.lowercased() == "pbp"
+        let tmp = fm.temporaryDirectory.appendingPathComponent("pbp2chd-\(UUID().uuidString)", isDirectory: true)
+        defer { if isPBP { try? fm.removeItem(at: tmp) } }
+
+        // Catch a .cue/.gdi whose track files are missing before chdman gets halfway.
+        let missing = Converter.missingTracks(for: src)
+        if !missing.isEmpty { fail(Converter.describeMissing(missing)); return nil }
+
+        // PBP extraction counts as the first 20% of the game, compression the rest.
+        let compressStart = isPBP ? 0.2 : 0.0
+        func overall(_ p: Double) -> Double { span.0 + (span.1 - span.0) * p }
+
+        // Step 1 (PBP only): PBP → BIN/CUE in a temp folder. CUE/GDI/ISO inputs go straight to chdman.
+        var cues = [src]
+        if isPBP {
+            guard let psxpackager else { fail("PSXPackager is missing from the app, so .pbp files can't be converted"); return nil }
+            update(id) { $0.detail = "Extracting BIN/CUE…"; $0.progress = nil }
+            do { try fm.createDirectory(at: tmp, withIntermediateDirectories: true) }
+            catch { fail("Can't create temporary folder: \(error.localizedDescription)"); return nil }
+            let s1 = await run(psxpackager, ["-i", src.path, "-o", tmp.path, "-x", "-v", "2"]) { [weak self] line in
+                self?.append("  [psxpackager] \(line)")
+            }
+            if cancelRequested { fail("Cancelled"); return nil }
+            cues = (fm.enumerator(at: tmp, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
+                .filter { $0.pathExtension.lowercased() == "cue" }
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            guard s1 == 0 || !cues.isEmpty else { fail("PSXPackager failed (exit \(s1)) — see log"); return nil }
+            guard !cues.isEmpty else { fail("PSXPackager produced no .cue file — see log"); return nil }
+            update(id) { $0.fraction = overall(compressStart) }
+        }
+        let discCount = Double(cues.count)
+        func jobFraction(disc n: Int, discProgress p: Double) -> Double {
+            overall(compressStart + (1 - compressStart) * (Double(n) + p) / discCount)
+        }
+
+        // Step 2: BIN/CUE → CHD, one per disc
+        var result = GameResult()
+        // With Verify on, each disc's share of the job is 75% compressing, 25% verifying.
+        let verifyShare = verify ? 0.25 : 0.0
+        for (n, cue) in cues.enumerated() {
+            let name = cues.count == 1 ? base : cue.deletingPathExtension().lastPathComponent
+            let out = outDir.appendingPathComponent(name + ".chd")
+            let disc = cues.count == 1 ? "" : " disc \(n + 1) of \(cues.count)"
+            var wroteThisDisc = false
+
+            if fm.fileExists(atPath: out.path) && !overwrite {
+                append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
+                result.made.append(out)
+                result.skipped += 1
+                update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1 - verifyShare) }
+            } else {
+                // .iso: CD or DVD. Everything else (.cue, .gdi, and PBP extractions) is a CD.
+                var args = ["createcd", "-i", cue.path, "-o", out.path]
+                if cue.pathExtension.lowercased() == "iso" {
+                    let dvd: Bool
+                    switch isoMode {
+                    case .cd: dvd = false
+                    case .dvd: dvd = true
+                    case .automatic:
+                        let (isDVD, why) = Converter.isoLooksLikeDVD(cue)
+                        dvd = isDVD
+                        append("  \(isDVD ? "DVD" : "CD") image: \(why)")
+                    }
+                    // One 2048-byte sector per hunk. chdman 0.263+ defaults to 4096, which PPSSPP warns
+                    // about; 2048 is what PPSSPP's and PCSX2's guides recommend.
+                    if dvd { args = ["createdvd", "-hs", "2048", "-i", cue.path, "-o", out.path] }
+                }
+                if overwrite { args.append("-f") }
+                let s2 = await runChdman(args, id: id, label: "Compressing\(disc) to CHD") {
+                    jobFraction(disc: n, discProgress: $0 * (1 - verifyShare))
+                }
+                if s2 != 0 || cancelRequested {
+                    try? fm.removeItem(at: out)
+                    fail(cancelRequested ? "Cancelled" : Converter.chdmanFailure(s2)); return nil
+                }
+                result.made.append(out)
+                // A PBP's size is shared between its discs; a CUE/GDI/ISO counts its own track files.
+                result.bytesIn += isPBP ? totalSize([src]) / discCount : totalSize(Converter.sourceFiles(for: cue))
+                result.bytesOut += totalSize([out])
+                wroteThisDisc = true
+            }
+
+            // Optional: check the CHD's checksums, including CHDs that already existed.
+            if verify {
+                let s3 = await runChdman(["verify", "-i", out.path], id: id, label: "Verifying\(disc)") {
+                    jobFraction(disc: n, discProgress: 1 - verifyShare + $0 * verifyShare)
+                }
+                if cancelRequested { fail("Cancelled"); return nil }
+                if s3 != 0 {
+                    // Delete a CHD we just wrote; leave one that was already there for the user to look at.
+                    if wroteThisDisc { try? fm.removeItem(at: out) }
+                    let why = s3 == Converter.stalledStatus ? "chdman stopped responding" : "see log"
+                    fail("\(out.lastPathComponent) failed verification\(wroteThisDisc ? " and was deleted" : "") — \(why)")
+                    return nil
+                }
+                append("  verified \(out.lastPathComponent)")
+            }
+        }
+
+        // Multi-disc playlist
+        if result.made.count > 1 && makeM3U {
+            let m3u = outDir.appendingPathComponent(base + ".m3u")
+            let body = result.made.map { $0.lastPathComponent }.joined(separator: "\n") + "\n"
+            do { try body.write(to: m3u, atomically: true, encoding: .utf8); append("  wrote \(m3u.lastPathComponent)") }
+            catch { append("  couldn't write \(m3u.lastPathComponent): \(error.localizedDescription)") }
+        }
+        return result
+    }
+
+    // MARK: Archives
+
+    nonisolated static let archiveExtensions: Set<String> = ["zip", "7z"]
+
+    /// 7-Zip's command-line tool, from Homebrew's sevenzip (7zz) or p7zip (7z).
+    var sevenZip: URL? { Converter.findTool("7zz") ?? Converter.findTool("7z") }
+
+    /// Unpacks a .zip (with macOS's own ditto) or .7z (with 7-Zip). Returns an error message, or nil.
+    private func unpackArchive(_ src: URL, to dir: URL) async -> String? {
+        do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+        catch { return "Can't create temporary folder: \(error.localizedDescription)" }
+        let exe: URL, args: [String]
+        if src.pathExtension.lowercased() == "zip" {
+            exe = URL(fileURLWithPath: "/usr/bin/ditto"); args = ["-x", "-k", src.path, dir.path]
+        } else {
+            guard let sz = sevenZip else {
+                return ".7z files need 7-Zip. Install it in Terminal with:  brew install sevenzip"
+            }
+            exe = sz; args = ["x", "-y", "-bd", "-o" + dir.path, src.path]
+        }
+        let status = await run(exe, args) { [weak self] line in self?.append("  [\(exe.lastPathComponent)] \(line)") }
+        return status == 0 ? nil : "Couldn't unpack the archive (exit \(status)) — see log"
+    }
+
+    /// Disc images in an unpacked archive, the way a folder scan finds them. A .bin with its own
+    /// .cue is reached through the .cue.
+    nonisolated static func gamesInFolder(_ dir: URL) -> [URL] {
+        (FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
+            .allObjects as? [URL] ?? [])
+            .filter { inputExtensions.contains($0.pathExtension.lowercased()) && !$0.path.contains("/__MACOSX/") }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    /// File names inside a .zip, read from its central directory without unpacking it.
+    /// Nil if it can't be read (for example a ZIP64 archive), so the caller can decide what to do.
+    nonisolated static func zipEntryNames(_ url: URL) -> [String]? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard let size = try? h.seekToEnd(), size >= 22 else { return nil }
+        let tailLen = min(size, 65_557)
+        guard (try? h.seek(toOffset: size - tailLen)) != nil, let tailData = try? h.read(upToCount: Int(tailLen)) else { return nil }
+        let tail = [UInt8](tailData)
+        func le16(_ b: [UInt8], _ i: Int) -> Int { Int(b[i]) | Int(b[i + 1]) << 8 }
+        func le32(_ b: [UInt8], _ i: Int) -> Int { le16(b, i) | le16(b, i + 2) << 16 }
+        guard let eocd = stride(from: tail.count - 22, through: 0, by: -1)
+            .first(where: { le32(tail, $0) == 0x06054b50 }) else { return nil }
+        let cdSize = le32(tail, eocd + 12), cdOffset = le32(tail, eocd + 16)
+        guard cdOffset != 0xFFFFFFFF, cdSize > 0, cdSize < 64 << 20, UInt64(cdOffset + cdSize) <= size else { return nil }
+        guard (try? h.seek(toOffset: UInt64(cdOffset))) != nil, let cdData = try? h.read(upToCount: cdSize) else { return nil }
+        let cd = [UInt8](cdData)
+        var names: [String] = [], i = 0
+        while i + 46 <= cd.count, le32(cd, i) == 0x02014b50 {
+            let n = le16(cd, i + 28), x = le16(cd, i + 30), c = le16(cd, i + 32)
+            guard i + 46 + n <= cd.count else { break }
+            names.append(String(decoding: cd[(i + 46)..<(i + 46 + n)], as: UTF8.self))
+            i += 46 + n + x + c
+        }
+        return names
+    }
+
+    /// Whether a folder scan should pick up this archive: only if it has a disc image inside, so a folder
+    /// of zipped cartridge games doesn't fill the list. .7z needs 7-Zip to look inside.
+    func archiveHasDiscImage(_ url: URL) -> Bool {
+        let wanted = Converter.inputExtensions
+        if url.pathExtension.lowercased() == "zip" {
+            guard let names = Converter.zipEntryNames(url) else { return true }   // can't tell: let the job decide
+            return names.contains { wanted.contains(($0 as NSString).pathExtension.lowercased()) }
+        }
+        guard let sz = sevenZip else { return false }
+        let p = Process()
+        p.executableURL = sz
+        p.arguments = ["l", "-ba", "-slt", url.path]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        return out.split(separator: "\n").contains { line in
+            line.hasPrefix("Path = ") && wanted.contains((String(line.dropFirst(7)) as NSString).pathExtension.lowercased())
+        }
+    }
+
+    // MARK: Track files
+
+    /// Track files a .cue or .gdi lists that aren't next to it. Empty for other files.
+    nonisolated static func missingTracks(for src: URL) -> [String] {
+        let dir = src.deletingLastPathComponent()
+        return trackNames(in: src).filter { !FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path) }
+    }
+
+    nonisolated static func describeMissing(_ names: [String]) -> String {
+        let shown = names.prefix(2).joined(separator: ", ")
+        return "Missing track file\(names.count == 1 ? "" : "s"): \(shown)\(names.count > 2 ? " and \(names.count - 2) more" : "")"
     }
 
     /// "412 MB, saved 260 MB (39%)", or just the size when the CHD isn't smaller (common for PBPs,
@@ -718,6 +872,20 @@ final class Converter: ObservableObject {
     /// exist inside the input's own folder.
     nonisolated static func sourceFiles(for src: URL) -> [URL] {
         let dir = src.deletingLastPathComponent().standardizedFileURL
+        var result = [src]
+        var seen: Set<String> = [src.standardizedFileURL.path]
+        for name in trackNames(in: src) {
+            let f = dir.appendingPathComponent(name).standardizedFileURL
+            guard f.path.hasPrefix(dir.path + "/"),
+                  FileManager.default.fileExists(atPath: f.path),
+                  seen.insert(f.path).inserted else { continue }
+            result.append(f)
+        }
+        return result
+    }
+
+    /// The track file names a .cue (FILE lines) or .gdi (one line per track) lists, as written.
+    nonisolated static func trackNames(in src: URL) -> [String] {
         let ext = src.pathExtension.lowercased()
         var names: [String] = []
 
@@ -742,16 +910,7 @@ final class Converter: ObservableObject {
             }
         }
 
-        var result = [src]
-        var seen: Set<String> = [src.standardizedFileURL.path]
-        for name in names {
-            let f = dir.appendingPathComponent(name).standardizedFileURL
-            guard f.path.hasPrefix(dir.path + "/"),
-                  FileManager.default.fileExists(atPath: f.path),
-                  seen.insert(f.path).inserted else { continue }
-            result.append(f)
-        }
-        return result
+        return names
     }
 
     /// Runs a command-line tool, streaming its output line by line to `onLine` on the main thread.
@@ -799,8 +958,11 @@ final class Converter: ObservableObject {
 final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
     static let repo = "nickgudauskas/Converterator"
+    nonisolated static let bundleID = "local.converterator"
 
     @Published var isChecking = false
+    /// "Downloading update…" etc. while an update installs, nil otherwise.
+    @Published var installStatus: String?
 
     var currentVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
@@ -823,12 +985,14 @@ final class UpdateChecker: ObservableObject {
     }
 
     private struct Release: Decodable {
+        struct Asset: Decodable { let name: String; let browser_download_url: String }
         let tag_name: String
         let html_url: String
+        let assets: [Asset]?
     }
 
     func check() {
-        guard !isChecking else { return }
+        guard !isChecking, installStatus == nil else { return }
         isChecking = true
         Task {
             defer { isChecking = false }
@@ -841,34 +1005,174 @@ final class UpdateChecker: ObservableObject {
                 let release = try JSONDecoder().decode(Release.self, from: data)
                 let latest = String(release.tag_name.drop(while: { $0 == "v" || $0 == "V" }))
 
-                if Self.isNewer(latest, than: currentVersion) {
-                    // Only ever open this repo's own release page.
-                    let page = URL(string: release.html_url)
-                        .filter { $0.absoluteString.hasPrefix("https://github.com/\(Self.repo)/") }
-                        ?? URL(string: "https://github.com/\(Self.repo)/releases/latest")!
-                    show(title: "Converterator \(latest) is available",
-                         message: "You have version \(currentVersion). Download the new version from GitHub, then replace the app in your Applications folder.",
-                         primary: "Download", secondary: "Later") { NSWorkspace.shared.open(page) }
-                } else {
+                guard Self.isNewer(latest, than: currentVersion) else {
                     show(title: "You're up to date",
-                         message: "Converterator \(currentVersion) is the latest version.", primary: "OK")
+                         message: "Converterator \(currentVersion) is the latest version.", buttons: ["OK"])
+                    return
+                }
+                // Only ever open or download this repo's own release files.
+                let prefix = "https://github.com/\(Self.repo)/"
+                let page = URL(string: release.html_url).filter { $0.absoluteString.hasPrefix(prefix) }
+                    ?? URL(string: "https://github.com/\(Self.repo)/releases/latest")!
+                let zip = release.assets?.first { $0.name == "Converterator.zip" }
+                    .flatMap { URL(string: $0.browser_download_url) }
+                    .filter { $0.absoluteString.hasPrefix(prefix + "releases/download/") }
+
+                let blocker = installBlocker(hasZip: zip != nil)
+                var message = "You have version \(currentVersion)."
+                if let blocker {
+                    message += " Download the new version from GitHub, then replace the app in your Applications folder.\n\n(\(blocker))"
+                    show(title: "Converterator \(latest) is available", message: message,
+                         buttons: ["Download", "Later"]) { if $0 == 0 { NSWorkspace.shared.open(page) } }
+                } else {
+                    message += " Converterator can download and install it now, then reopen itself. Your settings are kept."
+                    show(title: "Converterator \(latest) is available", message: message,
+                         buttons: ["Install and Relaunch", "Later", "View Release Notes"]) { choice in
+                        if choice == 0, let zip { self.install(from: zip, version: latest, releasePage: page) }
+                        if choice == 2 { NSWorkspace.shared.open(page) }
+                    }
                 }
             } catch {
                 show(title: "Couldn't check for updates",
                      message: "GitHub couldn't be reached. Check your internet connection and try again.\n\n(\(error.localizedDescription))",
-                     primary: "OK")
+                     buttons: ["OK"])
             }
         }
     }
 
-    private func show(title: String, message: String, primary: String, secondary: String? = nil,
-                      onPrimary: (() -> Void)? = nil) {
+    /// Why this copy can't update itself, or nil if it can.
+    private func installBlocker(hasZip: Bool) -> String? {
+        if Converter.shared.isRunning { return "A batch is converting. To install from inside the app, check again when it's finished." }
+        if !hasZip { return "This release has no Converterator.zip to install automatically." }
+        if Self.teamID(ofCodeAt: Bundle.main.bundleURL) == nil {
+            return "This copy wasn't downloaded from GitHub (it isn't signed with a Developer ID), so it can't update itself."
+        }
+        let parent = Bundle.main.bundleURL.deletingLastPathComponent()
+        if !FileManager.default.isWritableFile(atPath: parent.path) {
+            return "Converterator can't write to \(parent.path(percentEncoded: false))."
+        }
+        if Bundle.main.bundleURL.path.contains("/AppTranslocation/") {
+            return "Move Converterator to your Applications folder first."
+        }
+        return nil
+    }
+
+    private func install(from zip: URL, version: String, releasePage: URL) {
+        installStatus = "Downloading update…"
+        Task {
+            do {
+                let (file, response) = try await URLSession.shared.download(from: zip)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError("GitHub returned an error.") }
+                installStatus = "Installing update…"
+                let app = Bundle.main.bundleURL
+                guard let team = Self.teamID(ofCodeAt: app) else { throw UpdateError("This copy isn't signed with a Developer ID.") }
+                try await Task.detached {
+                    try UpdateChecker.installUpdate(zip: file, expectedVersion: version, teamID: team, replacing: app)
+                }.value
+                Self.relaunch(app)
+            } catch {
+                installStatus = nil
+                show(title: "Couldn't install the update",
+                     message: "\(error.localizedDescription)\n\nYou can download it from GitHub instead. Nothing was changed.",
+                     buttons: ["Download", "Cancel"]) { if $0 == 0 { NSWorkspace.shared.open(releasePage) } }
+            }
+        }
+    }
+
+    struct UpdateError: LocalizedError {
+        let errorDescription: String?
+        init(_ s: String) { errorDescription = s }
+    }
+
+    /// Unpacks the downloaded zip, checks the app inside, and swaps it in for the app at `target`.
+    /// The new app must have the same bundle ID, the expected version, a valid signature from the same
+    /// Developer ID team as this copy, and Gatekeeper's approval (notarized). Throws without touching
+    /// `target` if anything doesn't match.
+    nonisolated static func installUpdate(zip: URL, expectedVersion: String, teamID: String, replacing target: URL) throws {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("converterator-update-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+
+        guard runTool("/usr/bin/ditto", ["-x", "-k", zip.path, work.path]) == 0 else { throw UpdateError("The download couldn't be unzipped.") }
+        let new = work.appendingPathComponent("Converterator.app")
+        guard let info = NSDictionary(contentsOf: new.appendingPathComponent("Contents/Info.plist")),
+              info["CFBundleIdentifier"] as? String == bundleID else { throw UpdateError("The download doesn't contain Converterator.") }
+        guard info["CFBundleShortVersionString"] as? String == expectedVersion else {
+            throw UpdateError("The download is a different version than expected.")
+        }
+        guard validSignature(new, teamID: teamID) else {
+            throw UpdateError("The download isn't signed by the same developer as this copy, so it wasn't installed.")
+        }
+        guard runTool("/usr/sbin/spctl", ["--assess", "--type", "execute", new.path]) == 0 else {
+            throw UpdateError("macOS Gatekeeper didn't approve the download, so it wasn't installed.")
+        }
+
+        // Copy next to the current app first (same volume), then swap it in.
+        let staged = target.deletingLastPathComponent().appendingPathComponent(".Converterator-update-\(UUID().uuidString).app")
+        guard runTool("/usr/bin/ditto", [new.path, staged.path]) == 0 else {
+            try? fm.removeItem(at: staged)
+            throw UpdateError("The new version couldn't be copied next to the current one.")
+        }
+        do {
+            _ = try fm.replaceItemAt(target, withItemAt: staged)
+        } catch {
+            try? fm.removeItem(at: staged)
+            throw error
+        }
+    }
+
+    /// Checks the code signature of every architecture and nested executable, and that it's a
+    /// Developer ID signature for this app from the given team.
+    nonisolated static func validSignature(_ app: URL, teamID: String) -> Bool {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess, let code else { return false }
+        let safeTeam = teamID.filter { $0.isLetter || $0.isNumber }
+        let text = "anchor apple generic and identifier \"\(bundleID)\" and certificate leaf[subject.OU] = \"\(safeTeam)\""
+        var req: SecRequirement?
+        guard SecRequirementCreateWithString(text as CFString, [], &req) == errSecSuccess, let req else { return false }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode)
+        return SecStaticCodeCheckValidity(code, flags, req) == errSecSuccess
+    }
+
+    /// The Developer ID team that signed the code at `url`, or nil (ad-hoc or unsigned).
+    nonisolated static func teamID(ofCodeAt url: URL) -> String? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code else { return nil }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any] else { return nil }
+        return dict[kSecCodeInfoTeamIdentifier as String] as? String
+    }
+
+    nonisolated static func runTool(_ path: String, _ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    /// Quits, and reopens the app once this process has exited.
+    private static func relaunch(_ app: URL) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; /usr/bin/open \"$2\"",
+                       "sh", String(ProcessInfo.processInfo.processIdentifier), app.path]
+        try? p.run()
+        NSApp.terminate(nil)
+    }
+
+    /// Shows an alert as a sheet on the main window. `onChoice` gets the index of the button clicked.
+    private func show(title: String, message: String, buttons: [String], onChoice: ((Int) -> Void)? = nil) {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
-        alert.addButton(withTitle: primary)
-        if let secondary { alert.addButton(withTitle: secondary) }
-        let handle: (NSApplication.ModalResponse) -> Void = { if $0 == .alertFirstButtonReturn { onPrimary?() } }
+        for b in buttons { alert.addButton(withTitle: b) }
+        let handle: (NSApplication.ModalResponse) -> Void = { onChoice?($0.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue) }
         // Attach to the window as a sheet so it can't get lost behind other windows.
         if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) {
             alert.beginSheetModal(for: window, completionHandler: handle)
@@ -916,6 +1220,7 @@ struct ContentView: View {
     @State private var dropTargeted = false
     @State private var showLog = false
     @State private var confirmCancel = false
+    @State private var selection = Set<UUID>()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -981,6 +1286,13 @@ struct ContentView: View {
             if !running { NSApp.dockTile.badgeLabel = nil }
         }
         // Coming back from Terminal after installing chdman clears the banner without a relaunch.
+        .onReceive(NotificationCenter.default.publisher(for: .addFiles)) { _ in
+            if !c.isRunning { pickFiles() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .stopConverting)) { _ in
+            if c.isRunning { confirmCancel = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleLog)) { _ in showLog.toggle() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             c.recheckTools()
         }
@@ -1096,8 +1408,8 @@ struct ContentView: View {
     private var dropPrompt: some View {
         VStack(spacing: 10) {
             Image(systemName: "opticaldisc").font(.system(size: 48)).foregroundStyle(.secondary)
-            Text("Drop .pbp, .cue, .gdi or .iso files (or folders) here").font(.title3)
-            Text("BIN/CUE, GDI and ISO images are compressed straight to CHD. PBPs are unpacked to BIN/CUE first, and those temporary files are cleaned up. Drop a .chd file to turn it back into BIN/CUE, GDI or ISO.")
+            Text("Drop .pbp, .cue, .gdi, .iso, .zip or .7z files (or folders) here").font(.title3)
+            Text("BIN/CUE, GDI and ISO images are compressed straight to CHD. PBPs and zip or 7z archives are unpacked first, and those temporary files are cleaned up. Drop a .chd file to turn it back into BIN/CUE, GDI or ISO.")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
             Button("Add Files…", action: pickFiles).padding(.top, 4)
         }
@@ -1105,7 +1417,7 @@ struct ContentView: View {
     }
 
     private var jobList: some View {
-        List {
+        List(selection: $selection) {
             ForEach(c.jobs) { job in
                 HStack(spacing: 10) {
                     icon(for: job).frame(width: 20)
@@ -1122,10 +1434,17 @@ struct ContentView: View {
                 .padding(.vertical, 2)
                 .contextMenu {
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([job.url]) }
-                    Button("Remove from List") { c.remove(job.id) }.disabled(job.state == .working)
+                    // Acts on the whole selection when the clicked row is part of it.
+                    let targets = selection.contains(job.id) ? selection : [job.id]
+                    Button(targets.count > 1 ? "Remove \(targets.count) from List" : "Remove from List") {
+                        removeFromList(targets)
+                    }
+                    .disabled(job.state == .working && targets.count == 1)
                 }
             }
         }
+        // Delete (⌫) removes the selected rows.
+        .onDeleteCommand { removeFromList(selection) }
     }
 
     @ViewBuilder private func icon(for job: Job) -> some View {
@@ -1188,7 +1507,9 @@ struct ContentView: View {
                 Text(Self.versionLabel)
                     .foregroundStyle(.tertiary)
                     .textSelection(.enabled)
-                if updater.isChecking {
+                if let status = updater.installStatus {
+                    Text(status).foregroundStyle(.secondary)
+                } else if updater.isChecking {
                     Text("Checking…").foregroundStyle(.secondary)
                 } else {
                     Button("Check for Updates") { updater.check() }
@@ -1207,12 +1528,18 @@ struct ContentView: View {
         }
     }
 
+    /// Removes rows from the list (never the one converting), and drops them from the selection.
+    private func removeFromList(_ ids: Set<UUID>) {
+        for id in ids { c.remove(id) }
+        selection.subtract(ids)
+    }
+
     private func pickFiles() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
-        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd"].compactMap { UTType(filenameExtension: $0) } + [.folder]
-        panel.message = "Choose .pbp, .cue, .gdi or .iso files or folders to compress, or .chd files to extract"
+        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd", "zip", "7z"].compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.message = "Choose .pbp, .cue, .gdi, .iso, .zip or .7z files or folders to compress, or .chd files to extract"
         present(panel) { c.add(panel.urls) }
     }
 
@@ -1251,10 +1578,51 @@ struct ConverteratorApp: App {
     var body: some Scene {
         Window("Converterator", id: "main") { ContentView() }
             .defaultSize(width: 640, height: 520)
-            .commands {
-                CommandGroup(after: .appInfo) {
-                    Button("Check for Updates…") { UpdateChecker.shared.check() }
-                }
-            }
+            .commands { AppCommands() }
+    }
+}
+
+extension Notification.Name {
+    /// Menu commands that need the window: open the file picker, confirm a stop, show the log.
+    static let addFiles = Notification.Name("ConverteratorAddFiles")
+    static let stopConverting = Notification.Name("ConverteratorStopConverting")
+    static let toggleLog = Notification.Name("ConverteratorToggleLog")
+}
+
+/// Menu bar items and their keyboard shortcuts.
+struct AppCommands: Commands {
+    @ObservedObject private var c = Converter.shared
+
+    var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { UpdateChecker.shared.check() }
+        }
+        CommandGroup(replacing: .newItem) {
+            Button("Add Files…") { NotificationCenter.default.post(name: .addFiles, object: nil) }
+                .keyboardShortcut("o")
+                .disabled(c.isRunning)
+        }
+        CommandMenu("Convert") {
+            Button("Convert") { c.start() }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(c.isRunning || !c.toolsReady || !c.hasQueued)
+            Button("Stop Converting…") { NotificationCenter.default.post(name: .stopConverting, object: nil) }
+                .keyboardShortcut(".")
+                .disabled(!c.isRunning)
+            Divider()
+            Button("Clear Finished") { c.clearFinished() }
+                .keyboardShortcut("k")
+                .disabled(c.isRunning || c.jobs.isEmpty)
+            Button("Retry Failed") { c.retryFailed() }
+                .keyboardShortcut("r")
+                .disabled(c.isRunning || !c.jobs.contains { $0.state == .failed })
+            Button("Clear All") { c.clearAll() }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
+                .disabled(c.isRunning || c.jobs.isEmpty)
+        }
+        CommandGroup(after: .toolbar) {
+            Button("Show or Hide Log") { NotificationCenter.default.post(name: .toggleLog, object: nil) }
+                .keyboardShortcut("l")
+        }
     }
 }

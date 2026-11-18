@@ -67,8 +67,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.6.0</string>
-  <key>CFBundleVersion</key><string>11</string>
+  <key>CFBundleShortVersionString</key><string>1.7.0</string>
+  <key>CFBundleVersion</key><string>12</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
@@ -80,7 +80,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>
-      <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string></array>
+      <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string></array>
     </dict>
   </array>
 </dict>
