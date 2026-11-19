@@ -12,6 +12,9 @@ set -euo pipefail
 cd "${0:A:h}/.."
 
 command -v chdman >/dev/null || { echo "chdman not found: brew install rom-tools"; exit 1; }
+# The bundled tools (xdelta3 for patch tests), downloaded by build.sh into vendor/
+./build.sh --fetch-only >/dev/null
+XDELTA=$(ls -d "$PWD"/vendor/xdelta3-*/ | head -1); XDELTA=${XDELTA%/}
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/converterator-tests.XXXXXX")
 # The test program keeps its settings under its own name; remove them afterwards.
@@ -84,6 +87,55 @@ cp "$F/plain.iso" "$F/zip/stage/two/alpha.iso"; cp "$F/ps1.iso" "$F/zip/stage/tw
 (cd "$F/zip/stage/two" && zip -qr "$F/zip/two.zip" alpha.iso beta.iso)
 echo cart > "$F/zip/stage/rom.sfc"; (cd "$F/zip/stage" && zip -q "$F/zip/snes.zip" rom.sfc)
 
+# Patches: a one-track game changed in two places (outside PPF's check block at 0x9320), made into
+# xdelta, IPS, BPS and PPF patches. Plus a two-track game whose patch changes only track 2.
+mkdir -p "$F/patch"
+cp "$F/cd/game.bin" "$F/patch/Base.bin"
+printf 'FILE "Base.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n' > "$F/patch/Base.cue"
+cp "$F/patch/Base.bin" "$F/patch/target.bin"
+printf 'TRANSLATED TEXT GOES HERE' | dd of="$F/patch/target.bin" bs=1 seek=5000 conv=notrunc 2>/dev/null
+printf 'MORE ENGLISH' | dd of="$F/patch/target.bin" bs=1 seek=300000 conv=notrunc 2>/dev/null
+"$XDELTA/xdelta3" -e -f -s "$F/patch/Base.bin" "$F/patch/target.bin" "$F/patch/Base (English).xdelta"
+cp "$F/two/Two (Track 2).bin" "$F/patch/two-track2-target.bin"
+printf 'NEW AUDIO?' | dd of="$F/patch/two-track2-target.bin" bs=1 seek=1000 conv=notrunc 2>/dev/null
+"$XDELTA/xdelta3" -e -f -s "$F/two/Two (Track 2).bin" "$F/patch/two-track2-target.bin" "$F/patch/Two (Fixed).xdelta"
+/usr/bin/python3 -I - "$F/patch/Base.bin" "$F/patch/target.bin" "$F/patch" <<'PY'
+import sys, zlib, struct
+src, tgt, out = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read(), sys.argv[3]
+# changed ranges
+ranges, i = [], 0
+while i < len(tgt):
+    if src[i] != tgt[i]:
+        j = i
+        while j < len(tgt) and src[j] != tgt[j]: j += 1
+        ranges.append((i, tgt[i:j])); i = j
+    else: i += 1
+# IPS
+ips = b"PATCH" + b"".join(struct.pack(">I", o)[1:] + struct.pack(">H", len(d)) + d for o, d in ranges) + b"EOF"
+open(f"{out}/Base (IPS).ips", "wb").write(ips)
+# PPF3 with the 1024-byte check block from the source
+ppf = b"PPF30" + b"\x02" + b"Converterator test".ljust(50, b" ") + bytes([0, 1, 0, 0]) + src[0x9320:0x9320 + 1024]
+for o, d in ranges: ppf += struct.pack("<Q", o) + bytes([len(d)]) + d
+open(f"{out}/Base (PPF).ppf", "wb").write(ppf)
+# BPS: copy unchanged stretches from the source, write changed ones out
+def num(n):
+    b = bytearray()
+    while True:
+        x = n & 0x7f; n >>= 7
+        if n == 0: b.append(0x80 | x); break
+        b.append(x); n -= 1
+    return bytes(b)
+body, pos = bytearray(b"BPS1" + num(len(src)) + num(len(tgt)) + num(0)), 0
+for o, d in ranges:
+    if o > pos: body += num(((o - pos - 1) << 2) | 0)
+    body += num(((len(d) - 1) << 2) | 1) + d
+    pos = o + len(d)
+if pos < len(tgt): body += num(((len(tgt) - pos - 1) << 2) | 0)
+body += struct.pack("<II", zlib.crc32(src), zlib.crc32(tgt))
+body += struct.pack("<I", zlib.crc32(bytes(body)))
+open(f"{out}/Base (BPS).bps", "wb").write(bytes(body))
+PY
+
 # A Redump DAT that knows some of these
 h() { shasum -a 1 "$1" | cut -c1-40; }
 {
@@ -106,4 +158,4 @@ if ! swiftc -parse-as-library -swift-version 5 $(ls Sources/*.swift | grep -v '/
 fi
 
 echo "Running…"
-CONVERTERATOR_DATA_DIR="$W/data" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"
+CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"

@@ -74,6 +74,8 @@ struct Job: Identifiable {
     var bytesOut: Double = 0
     /// The CHDs this job produced or found already there.
     var outputs: [URL] = []
+    /// A patch (translation, fix) applied before compressing; the CHD is named after it.
+    var patch: URL?
 
     /// A .chd input is extracted back to BIN/CUE (or GDI/ISO) instead of being compressed.
     var isExtraction: Bool { url.pathExtension.lowercased() == "chd" }

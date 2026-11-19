@@ -237,6 +237,12 @@ struct ContentView: View {
                     icon(for: job).frame(width: 20)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(job.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        if let patch = job.patch {
+                            Label("Patch: \(patch.lastPathComponent) → \(Converter.safeFileName(patch.deletingPathExtension().lastPathComponent)).chd",
+                                  systemImage: "bandage")
+                                .font(.caption).foregroundStyle(Color.accentColor)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
                         if let p = job.progress, job.state == .working {
                             ProgressView(value: p).controlSize(.small)
                         }
@@ -248,6 +254,14 @@ struct ContentView: View {
                 .padding(.vertical, 2)
                 .contextMenu {
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([job.url]) }
+                    if !job.isExtraction {
+                        Divider()
+                        Button(job.patch == nil ? "Add Patch…" : "Change Patch…") { pickPatch(for: job) }
+                            .disabled(job.state == .working)
+                        if job.patch != nil {
+                            Button("Remove Patch") { c.setPatch(nil, for: job.id) }.disabled(job.state == .working)
+                        }
+                    }
                     // Acts on the whole selection when the clicked row is part of it.
                     let targets = selection.contains(job.id) ? selection : [job.id]
                     Button(targets.count > 1 ? "Remove \(targets.count) from List" : "Remove from List") {
@@ -386,11 +400,21 @@ struct ContentView: View {
         selection.subtract(ids)
     }
 
+    /// Chooses a patch (IPS, BPS, PPF or xdelta) to apply to one file before it's compressed.
+    private func pickPatch(for job: Job) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = PatchFormat.byExtension.keys.compactMap { UTType(filenameExtension: $0) }
+        panel.directoryURL = job.url.deletingLastPathComponent()
+        panel.message = "Choose a patch for \(job.url.lastPathComponent) (IPS, BPS, PPF or xdelta). The CHD will be named after the patch."
+        present(panel) { if let url = panel.url { c.setPatch(url, for: job.id) } }
+    }
+
     private func pickFiles() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
-        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd", "zip", "7z"].compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd", "zip", "7z", "xdelta", "vcdiff", "ppf", "bps", "ips"].compactMap { UTType(filenameExtension: $0) } + [.folder]
         panel.message = "Choose .pbp, .cue, .gdi, .iso, .zip or .7z files or folders to compress, or .chd files to extract"
         present(panel) { c.add(panel.urls) }
     }

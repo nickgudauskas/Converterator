@@ -230,6 +230,59 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         let (clear, skipped) = Cleanup.unambiguous(amb.filter { $0.source.path.contains("/amb") })
         check(clear.isEmpty && skipped == 2, "files sharing one CHD name are left out of cleanup")
 
+        // MARK: Patches
+        section("Patches")
+        @MainActor func chdBin(_ chd: URL) -> String? {
+            let out = W.appendingPathComponent("unpacked-\(UUID().uuidString)")
+            try? fm.createDirectory(at: out, withIntermediateDirectories: true)
+            let p = Process(); p.executableURL = c.chdman
+            p.arguments = ["extractcd", "-i", chd.path, "-o", out.appendingPathComponent("x.cue").path, "-sb"]
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try? p.run(); p.waitUntilExit()
+            let bins = ((try? fm.contentsOfDirectory(at: out, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension == "bin" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+            return bins.compactMap(sha1).joined(separator: ",")
+        }
+        let wantPatched = sha1(F.appendingPathComponent("patch/target.bin"))
+        check(Converter.findTool("xdelta3") != nil, "xdelta3 found")
+        for (patchName, chdName) in [("Base (English).xdelta", "Base (English).chd"), ("Base (IPS).ips", "Base (IPS).chd"),
+                                     ("Base (BPS).bps", "Base (BPS).chd"), ("Base (PPF).ppf", "Base (PPF).chd")] {
+            let ws = workspace("patch-\(PatchFormat.of(url(patchName))!.rawValue)", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/\(patchName)"], into: W)
+            c.clearAll(); c.add([ws.appendingPathComponent("Base.cue")])
+            if let id = c.jobs.first?.id { c.setPatch(ws.appendingPathComponent(patchName), for: id) }
+            c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+            let chd = ws.appendingPathComponent(chdName)
+            check(c.jobs.first?.state == .done && exists(chd) && chdBin(chd) == wantPatched,
+                  "\(PatchFormat.of(url(patchName))!.rawValue) patch applied, CHD named after it", c.jobs.first?.detail ?? "")
+            check(!exists(ws.appendingPathComponent("Base.chd")) && sha1(ws.appendingPathComponent("Base.bin")) == sha1(F.appendingPathComponent("patch/Base.bin")),
+                  "\(PatchFormat.of(url(patchName))!.rawValue): original untouched, no unpatched CHD")
+        }
+        // Wrong game: the patch must refuse, not produce garbage
+        let wrong = workspace("patch-wrong", from: F, ["cd/game.cue", "plain.iso"], into: W)
+        try! fm.copyItem(at: F.appendingPathComponent("two/Two (Track 1).bin"), to: wrong.appendingPathComponent("game.bin"))
+        for p in ["Base (English).xdelta", "Base (BPS).bps", "Base (PPF).ppf"] {
+            try? fm.copyItem(at: F.appendingPathComponent("patch/\(p)"), to: wrong.appendingPathComponent(p))
+            c.clearAll(); c.add([wrong.appendingPathComponent("game.cue")])
+            if let id = c.jobs.first?.id { c.setPatch(wrong.appendingPathComponent(p), for: id) }
+            c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+            check(c.jobs.first?.state == .failed && c.jobs.first?.detail.contains("doesn't fit") == true,
+                  "\(PatchFormat.of(url(p))!.rawValue) patch for a different game is refused", c.jobs.first?.detail ?? "")
+        }
+        // Multi-track: the xdelta patch for track 2 is found and applied to track 2 only
+        let mt = workspace("patch-two", from: F, ["two/Two.cue", "two/Two (Track 1).bin", "two/Two (Track 2).bin", "patch/Two (Fixed).xdelta"], into: W)
+        try! fm.moveItem(at: mt.appendingPathComponent("Two (Fixed).xdelta"), to: mt.appendingPathComponent("Two.xdelta"))
+        c.clearAll(); c.add([mt.appendingPathComponent("Two.cue")])
+        check(c.jobs.first?.patch?.lastPathComponent == "Two.xdelta", "a patch next to the game with the same name is picked up")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        let wantTwo = [F.appendingPathComponent("two/Two (Track 1).bin"), F.appendingPathComponent("patch/two-track2-target.bin")].compactMap(sha1).joined(separator: ",")
+        check(chdBin(mt.appendingPathComponent("Two.chd")) == wantTwo, "multi-track: only the track the patch was made for is changed",
+              c.jobs.first?.detail ?? "")
+        // Dropped together with its game
+        let dz = workspace("patch-drop", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (BPS).bps"], into: W)
+        c.clearAll(); c.add([dz.appendingPathComponent("Base.cue"), dz.appendingPathComponent("Base (BPS).bps")])
+        check(c.jobs.count == 1 && c.jobs.first?.patch?.lastPathComponent == "Base (BPS).bps", "a patch dropped with its game goes with it")
+        c.clearAll()
+
         // MARK: Pause and the saved queue
         section("Pause, Resume and the saved queue")
         let pz = W.appendingPathComponent("pause"); try? fm.createDirectory(at: pz, withIntermediateDirectories: true)

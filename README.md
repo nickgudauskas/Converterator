@@ -39,6 +39,10 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 ## Features
 
 - **Batch conversion.** Add any number of files or folders. Folders are searched recursively, and everything is converted one file at a time, with a status and progress bar for each. An overall bar shows progress through the whole batch ("Converting file 3 of 10") with an estimate of the time left, and the Dock icon shows the batch percentage. When the batch ends, a summary of converted, failed and not-started files, the total time taken and the space saved stays up, and if you're in another app a notification tells you it's done. The Mac won't idle-sleep while a batch runs (the display still can, and closing a laptop's lid still sleeps it). Progress is weighted by file size, so big discs count for more than small ones, and CHDs that already exist don't throw off the estimate.
+- **Patches (translations, fixes).** A patch is applied to a copy of the game before it's compressed, so the CHD is the patched game and your original files are never changed. IPS, BPS, PPF and xdelta patches all work (xdelta is the usual format for disc translations).
+  - **Attaching a patch:** put it next to the game with the same name (`Game.xdelta` beside `Game.cue`) and it's picked up automatically; or drop the patch together with its game; or right-click a file in the list → **Add Patch…**. The list shows each file's patch and the CHD it will make. **Remove Patch** takes it off again.
+  - **Which track:** BPS and PPF patches say which file they were made for, and xdelta checks its own result, so on a disc with several tracks the right one is found and patched; the other tracks are used as they are (linked, not copied). IPS patches can't tell, so they're applied to the first track. A patch made for a different version or region of the game is refused with a message instead of producing a broken disc. Most translation patches expect the Redump dump, and the Redump check (on the original, before patching) tells you if you have it.
+  - **Naming:** the CHD is named after the patch file, e.g. `Tengai Makyou Zero (English).xdelta` → `Tengai Makyou Zero (English).chd`. Only the patched CHD is made, and **Move source files to Trash** never applies to a patched game.
 - **Missing track files are caught early.** If a `.cue` or `.gdi` lists a track file that isn't there, it's marked failed with the missing file's name as soon as it's added.
 - **Drag and drop.** Drop files on the window or on the Dock icon, or use **Open With → Converterator** in Finder.
 - **Convert from Finder.** Select files or folders in Finder, right-click, and choose **Convert with Converterator** (under **Quick Actions** or **Services**, depending on your macOS version). They're added to the list and converted straight away; turn that off in **Settings** (⌘,) to only add them. If it doesn't appear, open Converterator once, or turn it on in **System Settings → Keyboard → Keyboard Shortcuts → Services → Files and Folders**. The app never makes itself the default for these file types.
@@ -81,9 +85,10 @@ From 1.13.0, everything it needs is built in, so there's nothing else to install
 
 - macOS 14 (Sonoma) or later. Apple Silicon or Intel.
 
-That's all. Both tools Converterator uses are built into the app:
+That's all. The tools Converterator uses are built into the app:
 - **chdman** (from MAME), in a universal build made from MAME's source code (see [How chdman is built](#how-chdman-is-built)).
 - **PSXPackager**, which carries its own copy of .NET.
+- **xdelta3**, for xdelta patches: the project's own dependency-free macOS builds for Apple Silicon and Intel, combined into one.
 
 Converterator uses its built-in chdman. If that's ever missing, it falls back to one installed with Homebrew (`brew install rom-tools`), and if there's none, a banner explains how to install it. Releases before 1.13.0 didn't include chdman and needed the Homebrew one.
 
@@ -169,8 +174,9 @@ swift make_icon.swift
 
 - [PSXPackager](https://github.com/RupertAvery/PSXPackager) by RupertAvery, for PBP extraction.
 - [chdman](https://docs.mamedev.org/tools/chdman.html) from the MAME project, for CHD compression.
+- [xdelta](https://github.com/jmacd/xdelta) by Joshua MacDonald, for applying xdelta patches.
 
-Converterator doesn't modify either tool. It runs them as separate programs, and the app includes an unmodified copy of each, which `build.sh` downloads.
+Converterator doesn't modify any of these tools. It runs them as separate programs, and the app includes an unmodified copy of each, which `build.sh` downloads.
 
 ### How chdman is built
 
@@ -180,4 +186,4 @@ To move to a newer MAME: run **Actions → Build chdman → Run workflow** with 
 
 ## License
 
-Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.
+Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. xdelta3 is under the Apache License 2.0; its license is included at `Contents/Resources/xdelta3/LICENSE`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.

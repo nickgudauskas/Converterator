@@ -203,7 +203,8 @@ final class CHDCheck: ObservableObject {
 /// Runs a command-line tool, collecting its output lines and reporting chdman-style "45.3% complete"
 /// progress. Stops the tool if its progress doesn't move for Converter.stallTimeout.
 enum ToolRun {
-    nonisolated static func run(_ exe: URL, _ args: [String],
+    /// `watchdog: false` for tools that print no progress (xdelta3), which would otherwise look stalled.
+    nonisolated static func run(_ exe: URL, _ args: [String], watchdog useWatchdog: Bool = true,
                                 started: @escaping @Sendable (Process) -> Void = { _ in },
                                 progress: @escaping @Sendable (Double) -> Void) async -> (Int32, [String]) {
         final class State: @unchecked Sendable {
@@ -233,7 +234,7 @@ enum ToolRun {
         let buffer = LineBuffer { line in if let f = state.add(line) { progress(f) } }
         let stall = await MainActor.run { Converter.stallTimeout }
         let watchdog = Task.detached {
-            while !Task.isCancelled {
+            while useWatchdog && !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(min(5, stall / 2)))
                 if state.idle > stall { state.markStalled(); p.terminate(); break }
             }
