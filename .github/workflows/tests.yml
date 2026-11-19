@@ -1,0 +1,37 @@
+# Runs ./tests/test.sh on an Apple Silicon Mac and an Intel Mac for every push and pull request.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple Silicon
+            os: macos-15
+          - name: Intel
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install chdman
+        run: brew install rom-tools
+
+      - name: Show the machine
+        run: |
+          uname -m
+          sw_vers
+          swiftc --version
+          chdman | head -1
+
+      - name: Run the tests
+        run: ./tests/test.sh
