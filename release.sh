@@ -34,7 +34,7 @@ step "Checking"
 [[ "$(git rev-parse --abbrev-ref HEAD)" == "main" ]] || fail "Switch to the main branch first."
 [[ -z "$(git status --porcelain)" ]] || fail "Commit or stash your changes first:\n$(git status --short)"
 gh auth status >/dev/null 2>&1 || fail "Sign in to GitHub first: gh auth login"
-git fetch -q origin main
+git fetch -q --tags origin main
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" || -n "$(git log origin/main..HEAD --oneline)" ]] \
   || fail "main is behind GitHub; pull first."
 LATEST=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || echo "v0")
