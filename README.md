@@ -50,13 +50,14 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 - **Check dumps against Redump.** [Redump](http://redump.org) publishes the checksums of known good disc dumps. Each BIN/CUE, GDI or ISO is checked before it's compressed, and its status line shows **✓ Redump**, **⚠ partial Redump match** (some tracks differ) or **⚠ not in Redump**. The log names the matching game. With **Move source files to Trash** on, the originals of dumps that don't match are kept. PBPs are a repackaged format, so they can't be checked.
   - **DAT files download themselves.** When Converterator opens, it checks redump.org (at most once a day) and downloads newer DATs for the systems chosen in **Settings** (⌘,): PlayStation, PS2, PSP, Sega CD, Saturn and Dreamcast to start with. Only the request for the file goes out; nothing about you or your files is sent. redump.org only offers plain HTTP, so the app allows that for redump.org alone. Turn downloading off, pick other systems, or add your own DAT files in Settings. Downloaded DATs are kept in `~/Library/Application Support/Converterator/Redump`.
   - **Name CHDs after Redump.** Turn on **Name CHDs after the matching Redump game** in Settings, and a dump that matches gets Redump's exact title, like `Armored Core (USA).chd`, instead of the original file's name.
-- **Check CHDs you already have.** **File → Check CHDs Against Redump…** takes CHDs or folders of them, unpacks each to a temporary folder (one file per track, as Redump lists them), checks it, and deletes the temporary files. It needs free space for one disc at a time. Afterwards, **Rename to Redump Names** gives each matching CHD its Redump title and fixes any `.m3u` next to it. Dreamcast GD-ROM CHDs are unpacked to GDI tracks, which Redump's Dreamcast DATs don't list the same way, so they may not match.
+- **Check CHDs you already have.** **File → Check CHDs Against Redump…** takes CHDs or folders of them, unpacks each to a temporary folder (one file per track, as Redump lists them), checks it, and deletes the temporary files. It needs free space for one disc at a time. Afterwards, **Rename to Redump Names** gives each matching CHD its Redump title and fixes any `.m3u` next to it. Results are remembered: a CHD that hasn't changed (same size and date) isn't unpacked again the next time, unless you turn on **Check again if checked before**. A "no match" is rechecked automatically when newer DATs are loaded. CHDs converted with the Redump check on are remembered from the start.
+  - **Dreamcast** GD-ROM CHDs are unpacked in Redump's layout, so CHDs made from Redump sets match. A CHD made from a GDI (TOSEC) image matches too if the game has three tracks, which most do. GDI files leave out the gaps between later tracks, so games with more tracks may show as a partial match.
 - **Library report.** **File → Library Report…** looks over a whole folder (your ROMs folder, say) without changing anything, and lists:
   - disc images not converted yet, with **Add All to Converter**
   - originals that already have CHDs, with **Clean Up…**
   - multi-disc games with a disc missing ("has disc 1, 3; missing 2"), using "Disc 2 of 3" in the name or Redump's disc count when it knows the game
   - multi-disc games without a playlist, with **Make Playlists**
-  - how many CHDs are named as in Redump, with **Check CHDs…** to check them all
+  - how many CHDs match Redump, don't match, or haven't been checked yet (from remembered results, so nothing is unpacked), with **Check Unchecked…**
 - **Clean up originals.** For folders you converted without the Trash option: choose **File → Clean Up Originals…**, pick a folder, and Converterator lists every disc image (and zip or 7z of them) that already has its CHD next to it, or in your **Save to:** folder. A multi-disc PBP counts when every CHD in its `.m3u` is there. CHDs renamed after Redump are found too, from a record Converterator keeps of what it converted. Untick anything you want to keep and click **Move to Trash**. With **Verify each CHD before moving its originals** on (the default), each CHD is checked with `chdman verify` first, and anything whose CHD fails stays. If two files would share one CHD name (say, many `Disc 1.cue` files and one shared **Save to:** folder), they're left out, since it's unclear which one the CHD came from.
 - **Optional cleanup.** Turn on **Move source files to Trash after a successful conversion** to clear out the originals. That's the `.pbp`, `.cue`, `.gdi` or `.iso`, plus any `.bin` or track files a `.cue` or `.gdi` lists. When extracting, it's the `.chd`. Files go to the Trash, so they can be restored, and only after every CHD for that game was newly written. If a CHD already existed and was skipped, the originals stay. The option turns itself off each time the app starts.
 - **Cancel and retry.** **Cancel** asks you to confirm, then stops the current file and deletes its unfinished CHD. Finished CHDs and your original files are kept, and files not yet started stay in the list. **Clear → Retry Failed** re-queues only the failures.
@@ -100,6 +101,14 @@ The first build downloads PSXPackager v1.8.0 (the Apple Silicon and Intel builds
 
 `./build.sh` signs the app ad-hoc, which is fine on your own Mac. A copy moved to another Mac would be blocked by Gatekeeper until allowed with **System Settings → Privacy & Security → Open Anyway**.
 
+### Testing
+
+```bash
+./tests/test.sh
+```
+
+It makes small sample disc images (CD, PS2/PSP/plain ISOs, a Dreamcast GD-ROM, zips, a damaged CHD and a Redump DAT that knows some of them), compiles the app's code with `tests/Tests.swift`, and checks conversion, verify, extraction, archives, playlists, Redump matching and renaming, CHD checks and remembered results, Clean Up Originals, the Library Report and the updater's signature checks. It takes about half a minute and needs `chdman`. Add `--network` to also download one real DAT from redump.org. Everything happens in a temporary folder; your settings, Application Support folder and Trash aren't touched.
+
 ### Signing and notarizing a release
 
 You need an Apple Developer account with a **Developer ID Application** certificate in your Keychain. Save your notarization login once (it asks for an [app-specific password](https://account.apple.com)):
@@ -137,7 +146,8 @@ swift make_icon.swift
 
 | File | Purpose |
 |---|---|
-| `main.swift` | The whole app: SwiftUI interface, the conversion queue, and running PSXPackager and `chdman`. |
+| `Sources/` | The app's Swift code, one file per area: `Converter.swift` (the conversion queue, PSXPackager and `chdman`), `Redump.swift` (DATs, matching, downloads, remembered results), `Cleanup.swift`, `CHDCheck.swift`, `LibraryReport.swift`, `Playlist.swift`, `Updates.swift`, the windows (`ContentView.swift`, `SettingsView.swift`) and `App.swift` (entry point, menus, Finder service). |
+| `tests/test.sh`, `tests/Tests.swift` | The tests (see below). |
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
 | `notarize.sh` | Builds with Developer ID signing, notarizes with Apple, staples, and zips into `dist/`. |
 | `psxpackager.entitlements` | Hardened-runtime permissions the bundled .NET PSXPackager needs. |

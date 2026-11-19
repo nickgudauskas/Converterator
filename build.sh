@@ -37,7 +37,7 @@ mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources/psxpackager"
 for ARCH in arm64 x86_64; do
   swiftc -parse-as-library -swift-version 5 -O \
     -target "$ARCH-apple-macos14" \
-    main.swift -o "build/Converterator-$ARCH"
+    Sources/*.swift -o "build/Converterator-$ARCH"
 done
 lipo -create build/Converterator-arm64 build/Converterator-x86_64 \
   -output "$APP/Contents/MacOS/Converterator"
@@ -67,8 +67,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.10.0</string>
-  <key>CFBundleVersion</key><string>16</string>
+  <key>CFBundleShortVersionString</key><string>1.11.0</string>
+  <key>CFBundleVersion</key><string>17</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

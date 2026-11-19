@@ -1,0 +1,89 @@
+// Converterator — The Settings window.
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+import UserNotifications
+import CryptoKit
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @ObservedObject private var c = Converter.shared
+    @ObservedObject private var redump = RedumpDB.shared
+
+    var body: some View {
+        Form {
+            Section("Finder") {
+                Toggle("Start converting right away", isOn: $c.startFromFinder)
+                Text("For files sent with Convert with Converterator in Finder's right-click menu (under Quick Actions or Services). Turned off, they're just added to the list.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Redump") {
+                Text("Redump lists the checksums of known good disc dumps. With its DAT files loaded, each BIN/CUE, GDI or ISO is checked before it's converted, and File → Check CHDs Against Redump… checks CHDs you already have. PBPs can't be checked.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Check dumps while converting", isOn: $redump.enabled)
+                Toggle("Name CHDs after the matching Redump game", isOn: $redump.renameToRedump)
+                Text("For example “Armored Core (USA).chd” instead of “armored core.chd”. Only for dumps that match.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("With “Move source files to Trash” on, keep the originals of dumps that don't match", isOn: $redump.keepUnmatched)
+            }
+            Section("Redump DAT files") {
+                Toggle("Download from redump.org automatically", isOn: $redump.autoDownload)
+                Text("Checked when Converterator opens, at most once a day. Only newer DATs are downloaded. redump.org only offers plain HTTP.")
+                    .font(.caption).foregroundStyle(.secondary)
+                DisclosureGroup("Systems (\(redump.systems.count))") {
+                    ForEach(RedumpDB.systems, id: \.slug) { sys in
+                        Toggle(isOn: Binding(
+                            get: { redump.systems.contains(sys.slug) },
+                            set: { on in if on { redump.systems.insert(sys.slug) } else { redump.systems.remove(sys.slug) } })) {
+                            HStack {
+                                Text(sys.name)
+                                Spacer()
+                                if let dat = redump.dats.first(where: { $0.system == sys.slug }) {
+                                    Text("\(dat.games) games\(redump.datDate(sys.slug).map { ", \($0)" } ?? "")")
+                                        .foregroundStyle(.secondary).monospacedDigit()
+                                }
+                            }
+                        }
+                    }
+                }
+                HStack {
+                    if redump.isDownloading { ProgressView().controlSize(.small) }
+                    Text(redump.downloadStatus.isEmpty ? "Not checked yet." : redump.downloadStatus)
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Check Now") { redump.updateFromWeb(force: true) }
+                        .disabled(!redump.autoDownload || redump.isDownloading)
+                }
+                let own = redump.dats.filter { $0.system == nil }
+                ForEach(own) { dat in
+                    HStack {
+                        Text(dat.url.deletingPathExtension().lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Text("\(dat.games) games").foregroundStyle(.secondary).monospacedDigit()
+                        Button("Remove") { redump.remove(dat) }
+                    }
+                }
+                if redump.isLoading { HStack { ProgressView().controlSize(.small); Text("Reading DAT files…") } }
+                if let err = redump.lastError { Text(err).font(.caption).foregroundStyle(.orange) }
+                HStack {
+                    Text("\(redump.index.gameCount) games loaded").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Add Your Own DAT Files…", action: addDATs)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 560)
+        .frame(minHeight: 520)
+    }
+
+    private func addDATs() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = ["dat", "xml", "zip"].compactMap { UTType(filenameExtension: $0) }
+        panel.message = "Choose Redump DAT files (.dat, or the .zip they're downloaded as)"
+        let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK { redump.add(panel.urls) } }
+        if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
+    }
+}
