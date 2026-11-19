@@ -24,6 +24,8 @@ struct Job: Identifiable {
     /// Bytes in and out for CHDs this job newly wrote, for "saved 1.2 GB". Zero when nothing was written.
     var bytesIn: Double = 0
     var bytesOut: Double = 0
+    /// The CHDs this job produced or found already there.
+    var outputs: [URL] = []
 
     /// A .chd input is extracted back to BIN/CUE (or GDI/ISO) instead of being compressed.
     var isExtraction: Bool { url.pathExtension.lowercased() == "chd" }
@@ -246,7 +248,7 @@ final class Converter: ObservableObject {
     func retryFailed() {
         for i in jobs.indices where jobs[i].state == .failed {
             jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil; jobs[i].fraction = 0
-            jobs[i].bytesIn = 0; jobs[i].bytesOut = 0
+            jobs[i].bytesIn = 0; jobs[i].bytesOut = 0; jobs[i].outputs = []
         }
     }
 
@@ -360,10 +362,22 @@ final class Converter: ObservableObject {
             batchEnd = Date()
             isRunning = false
             if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
+            writePlaylists()
             append(cancelRequested ? "— Cancelled —" : "— All done —")
             if !cancelRequested {
                 Notifier.batchFinished(counts: batchCountsText, saved: batchSavedText, failed: batchFailedCount > 0)
             }
+        }
+    }
+
+    /// After a batch: an .m3u for each multi-disc game that now has 2+ CHDs in a folder
+    /// ("Game (Disc 1).chd", "Game (Disc 2).chd" → "Game.m3u"), when "Make .m3u playlist" is on.
+    private func writePlaylists() {
+        guard makeM3U else { return }
+        let made = Set(batchJobs.flatMap(\.outputs).map(\.standardizedFileURL))
+        let dirs = Set(made.map { $0.deletingLastPathComponent() })
+        for dir in dirs {
+            for m3u in Playlist.make(in: dir, only: made) { append("wrote \(m3u.lastPathComponent)") }
         }
     }
 
@@ -462,6 +476,7 @@ final class Converter: ObservableObject {
 
         // Remember which CHDs came from this file, so Clean Up Originals finds them even when renamed.
         ConversionLog.record(source: src, chds: made)
+        update(id) { $0.outputs = made }
 
         // If every CHD already existed (and wasn't verified), this job took no real time:
         // keep it out of the speed estimate.
@@ -1398,12 +1413,7 @@ final class Cleanup: ObservableObject {
         let sevenZip = Converter.shared.sevenZip
         Task.detached {
             let found = Cleanup.findConverted(in: folder, outputDir: outDir, sevenZip: sevenZip, log: ConversionLog.load())
-            // Two different originals pointing at the same CHD (e.g. many "Disc 1.cue" files and one shared
-            // Save to: folder) can't both be its source. Leave them all out rather than guess.
-            var uses: [String: Int] = [:]
-            for item in found { for chd in Set(item.chds.map(\.standardizedFileURL.path)) { uses[chd, default: 0] += 1 } }
-            let clear = found.filter { $0.chds.allSatisfy { uses[$0.standardizedFileURL.path] == 1 } }
-            let skipped = found.count - clear.count
+            let (clear, skipped) = Cleanup.unambiguous(found)
             await MainActor.run {
                 self.ambiguous = skipped
                 self.items = clear
@@ -1478,11 +1488,28 @@ final class Cleanup: ObservableObject {
 
     // MARK: Matching
 
+    /// Two different originals pointing at the same CHD (e.g. many "Disc 1.cue" files and one shared
+    /// Save to: folder) can't both be its source. Leaves them all out rather than guess; returns how many.
+    nonisolated static func unambiguous(_ found: [Item]) -> ([Item], Int) {
+        var uses: [String: Int] = [:]
+        for item in found { for chd in Set(item.chds.map(\.standardizedFileURL.path)) { uses[chd, default: 0] += 1 } }
+        let clear = found.filter { $0.chds.allSatisfy { uses[$0.standardizedFileURL.path] == 1 } }
+        return (clear, found.count - clear.count)
+    }
+
     /// Every disc image (or archive of them) under `folder` whose CHDs all exist, next to it or in `outputDir`.
     nonisolated static func findConverted(in folder: URL, outputDir: URL?, sevenZip: URL?,
                                           log: [String: [String]] = [:]) -> [Item] {
+        scanSources(in: folder, outputDir: outputDir, sevenZip: sevenZip, log: log).converted
+    }
+
+    /// Every disc image (or archive with one inside) under `folder`, split into those whose CHDs all exist
+    /// and those that haven't been converted.
+    nonisolated static func scanSources(in folder: URL, outputDir: URL?, sevenZip: URL?,
+                                        log: [String: [String]] = [:]) -> (converted: [Item], unconverted: [URL]) {
         let fm = FileManager.default
         var result: [Item] = []
+        var unconverted: [URL] = []
         let files = (fm.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
             .allObjects as? [URL] ?? [])
             .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
@@ -1502,7 +1529,8 @@ final class Cleanup: ObservableObject {
             } else if Converter.archiveExtensions.contains(ext) {
                 let names = ext == "zip" ? Converter.zipEntryNames(f) : sevenZip.flatMap { sevenZipNames(f, tool: $0) }
                 let games = (names ?? []).filter { Converter.inputExtensions.contains(($0 as NSString).pathExtension.lowercased()) }
-                if !games.isEmpty {
+                if games.isEmpty { continue }   // not a disc archive (e.g. zipped cartridge games)
+                do {
                     var all: [URL] = []
                     for g in games {
                         let name = (g as NSString).lastPathComponent
@@ -1516,9 +1544,11 @@ final class Cleanup: ObservableObject {
             }
             if let chds, !chds.isEmpty {
                 result.append(Item(source: f, files: trash, bytes: totalSize(trash), chds: chds))
+            } else if Converter.inputExtensions.contains(ext) || Converter.archiveExtensions.contains(ext) {
+                unconverted.append(f)
             }
         }
-        return result
+        return (result, unconverted)
     }
 
     /// The CHDs for one game: `base.chd`, or for a multi-disc PBP the CHDs its `base.m3u` lists.
@@ -1735,6 +1765,370 @@ struct CleanupView: View {
         let window = NSApp.keyWindow
         let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK, let url = panel.url { m.scan(url) } }
         if let window { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
+    }
+}
+
+// MARK: - Multi-disc playlists
+
+/// Recognises the disc number in a file name: "Game (USA) (Disc 2)", "Game (Disc 2 of 3)",
+/// "Game - Disc 2" (how PSXPackager names discs), "Game CD2".
+struct DiscName: Hashable, Sendable {
+    let key: String     // the name without the disc part, e.g. "Game (USA)"
+    let disc: Int
+    let of: Int?        // from "(Disc 2 of 3)", if given
+
+    nonisolated static func parse(_ name: String) -> DiscName? {
+        let patterns = [
+            #"\s*\((?:Disc|Disk|CD)\s*(\d{1,2})(?:\s*of\s*(\d{1,2}))?\)"#,     // (Disc 2) / (Disc 2 of 3), anywhere
+            #"\s*[-_]\s*(?:Disc|Disk|CD)\s*(\d{1,2})(?:\s*of\s*(\d{1,2}))?$"#, // " - Disc 2" at the end
+            #"\s+(?:Disc|Disk|CD)\s*(\d{1,2})(?:\s*of\s*(\d{1,2}))?$"#,        // " Disc 2" / " CD2" at the end
+        ]
+        for pattern in patterns {
+            guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let m = re.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
+                  let whole = Range(m.range, in: name), let n = Range(m.range(at: 1), in: name),
+                  let disc = Int(name[n]), disc >= 1 else { continue }
+            let of = Range(m.range(at: 2), in: name).flatMap { Int(name[$0]) }
+            var key = name
+            key.removeSubrange(whole)
+            key = key.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespaces)
+            while key.hasSuffix("-") || key.hasSuffix("_") { key = String(key.dropLast()).trimmingCharacters(in: .whitespaces) }
+            guard !key.isEmpty else { continue }
+            return DiscName(key: key, disc: disc, of: of)
+        }
+        return nil
+    }
+}
+
+enum Playlist {
+    /// Multi-disc CHD sets in one folder: playlist name → its CHDs in disc order. Only sets with 2+ discs.
+    nonisolated static func sets(in dir: URL) -> [String: [URL]] {
+        let chds = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension.lowercased() == "chd" }
+        var groups: [String: [(Int, URL)]] = [:]
+        for chd in chds {
+            guard let d = DiscName.parse(chd.deletingPathExtension().lastPathComponent) else { continue }
+            groups[d.key, default: []].append((d.disc, chd))
+        }
+        return groups.filter { Set($0.value.map(\.0)).count >= 2 }
+            .mapValues { $0.sorted { $0.0 < $1.0 }.map(\.1) }
+    }
+
+    /// The CHD names each .m3u in `dir` lists.
+    nonisolated static func existing(in dir: URL) -> [URL: [String]] {
+        let m3us = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension.lowercased() == "m3u" }
+        var result: [URL: [String]] = [:]
+        for m in m3us {
+            guard let text = try? String(contentsOf: m, encoding: .utf8) else { continue }
+            result[m] = text.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        }
+        return result
+    }
+
+    /// Writes `Name.m3u` for each multi-disc set in `dir` that doesn't have one. A set counts as having
+    /// one if any .m3u there already lists any of its discs; if that's its own `Name.m3u` and it's
+    /// missing a disc we now have (Disc 3 converted later), it's brought up to date. Other people's
+    /// playlists are never changed. `only` limits it to sets containing one of those CHDs.
+    /// Returns the playlists written.
+    @discardableResult
+    nonisolated static func make(in dir: URL, only: Set<URL>? = nil) -> [URL] {
+        let have = existing(in: dir)
+        var written: [URL] = []
+        for (key, discs) in sets(in: dir) {
+            if let only, !discs.contains(where: { only.contains($0.standardizedFileURL) }) { continue }
+            let names = discs.map(\.lastPathComponent)
+            let target = dir.appendingPathComponent(Converter.safeFileName(key) + ".m3u")
+            let mentioning = have.filter { !Set($0.value).isDisjoint(with: names) }
+            if let current = mentioning[target] {
+                // Ours (same name): update only if it lists nothing but this set's discs and is missing some.
+                guard Set(current).isSubset(of: Set(names)), current != names else { continue }
+            } else if !mentioning.isEmpty {
+                continue   // another playlist already covers these discs (e.g. one written for a PBP)
+            } else if FileManager.default.fileExists(atPath: target.path) {
+                continue   // a playlist with this name lists something else; leave it alone
+            }
+            let body = names.joined(separator: "\n") + "\n"
+            if (try? body.write(to: target, atomically: true, encoding: .utf8)) != nil { written.append(target) }
+        }
+        return written
+    }
+
+    /// Sets in `dir` that have no playlist yet.
+    nonisolated static func missing(in dir: URL) -> [(name: String, discs: [URL])] {
+        let have = existing(in: dir).values.flatMap { $0 }
+        let listed = Set(have)
+        return sets(in: dir)
+            .filter { _, discs in discs.allSatisfy { !listed.contains($0.lastPathComponent) } }
+            .map { (name: $0.key, discs: $0.value) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
+// MARK: - Library report
+
+/// A look over a whole folder of games: what's converted, what isn't, leftovers, missing discs and playlists.
+struct LibraryReport: Sendable {
+    struct MissingDiscs: Identifiable, Sendable {
+        let id = UUID()
+        let dir: URL
+        let name: String
+        let have: [Int]
+        let expected: Int
+        let fromRedump: Bool
+        var missing: [Int] { (1...max(expected, have.max() ?? 1)).filter { !have.contains($0) } }
+    }
+    struct NeedsPlaylist: Identifiable, Sendable {
+        let id = UUID()
+        let dir: URL
+        let name: String
+        let discs: [URL]
+    }
+
+    var chds: [URL] = []
+    var chdBytes = 0.0
+    var redumpNamed = 0               // CHDs whose name is exactly a Redump game name
+    var unconverted: [URL] = []
+    var unconvertedBytes = 0.0
+    var leftovers: [Cleanup.Item] = []  // originals whose CHDs exist
+    var leftoverBytes = 0.0
+    var missingDiscs: [MissingDiscs] = []
+    var needsPlaylist: [NeedsPlaylist] = []
+
+    nonisolated static func build(folder: URL, outputDir: URL?, sevenZip: URL?, log: [String: [String]],
+                                  redump: RedumpIndex, status: @escaping @Sendable (String) -> Void) -> LibraryReport {
+        var r = LibraryReport()
+        let fm = FileManager.default
+        status("Listing files…")
+        let all = (fm.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
+            .allObjects as? [URL] ?? [])
+        r.chds = all.filter { $0.pathExtension.lowercased() == "chd" }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        r.chdBytes = totalSize(r.chds)
+
+        // Redump game names, and for multi-disc games how many discs Redump lists.
+        let redumpNames = Set(redump.trackCount.keys)
+        var redumpDiscs: [String: Int] = [:]
+        for name in redumpNames {
+            if let d = DiscName.parse(name) { redumpDiscs[d.key] = max(redumpDiscs[d.key] ?? 0, d.of ?? d.disc) }
+        }
+        r.redumpNamed = r.chds.filter { redumpNames.contains($0.deletingPathExtension().lastPathComponent) }.count
+
+        status("Matching originals with CHDs…")
+        let (converted, unconverted) = Cleanup.scanSources(in: folder, outputDir: outputDir, sevenZip: sevenZip, log: log)
+        r.leftovers = Cleanup.unambiguous(converted).0
+        r.leftoverBytes = r.leftovers.reduce(0) { $0 + $1.bytes }
+        r.unconverted = unconverted
+        r.unconvertedBytes = unconverted.reduce(0) { $0 + totalSize(Converter.sourceFiles(for: $1)) }
+
+        status("Looking for missing discs and playlists…")
+        // Disc sets per folder, counting both CHDs and not-yet-converted disc images.
+        let discFiles = r.chds + unconverted.filter { Converter.inputExtensions.contains($0.pathExtension.lowercased()) }
+        var sets: [String: (dir: URL, name: String, discs: Set<Int>, of: Int?)] = [:]
+        for f in discFiles {
+            guard let d = DiscName.parse(f.deletingPathExtension().lastPathComponent) else { continue }
+            let dir = f.deletingLastPathComponent()
+            let k = dir.path + "\u{0}" + d.key
+            var e = sets[k] ?? (dir, d.key, [], nil)
+            e.discs.insert(d.disc)
+            if let of = d.of { e.of = max(e.of ?? 0, of) }
+            sets[k] = e
+        }
+        for e in sets.values {
+            let redumpCount = redumpDiscs[e.name]
+            let expected = e.of ?? redumpCount ?? (e.discs.max() ?? 1)
+            let set = MissingDiscs(dir: e.dir, name: e.name, have: e.discs.sorted(), expected: expected,
+                                   fromRedump: e.of == nil && redumpCount != nil)
+            if !set.missing.isEmpty { r.missingDiscs.append(set) }
+        }
+        r.missingDiscs.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        for dir in Set(r.chds.map { $0.deletingLastPathComponent() }) {
+            r.needsPlaylist += Playlist.missing(in: dir).map { NeedsPlaylist(dir: dir, name: $0.name, discs: $0.discs) }
+        }
+        r.needsPlaylist.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return r
+    }
+}
+
+@MainActor
+final class Library: ObservableObject {
+    static let shared = Library()
+
+    @Published var folder: URL?
+    @Published private(set) var report: LibraryReport?
+    @Published private(set) var isScanning = false
+    @Published private(set) var status = ""
+    @Published var message = ""
+
+    func scan(_ folder: URL) {
+        self.folder = folder
+        isScanning = true
+        message = ""
+        let outDir = Converter.shared.outputDir, sevenZip = Converter.shared.sevenZip
+        let redump = RedumpDB.shared.index
+        Task.detached {
+            let r = LibraryReport.build(folder: folder, outputDir: outDir, sevenZip: sevenZip, log: ConversionLog.load(),
+                                        redump: redump) { s in Task { @MainActor in self.status = s } }
+            await MainActor.run { self.report = r; self.isScanning = false }
+        }
+    }
+
+    func rescan() { if let folder { scan(folder) } }
+
+    func makePlaylists() {
+        guard let report else { return }
+        var written = 0
+        for dir in Set(report.needsPlaylist.map(\.dir)) { written += Playlist.make(in: dir).count }
+        message = "Wrote \(written) playlist\(written == 1 ? "" : "s")."
+        rescan()
+    }
+}
+
+struct LibraryView: View {
+    @ObservedObject private var m = Library.shared
+    @ObservedObject private var c = Converter.shared
+    @ObservedObject private var redump = RedumpDB.shared
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(m.folder?.path(percentEncoded: false) ?? "Choose a folder of games, such as your whole ROMs folder.")
+                    .lineLimit(1).truncationMode(.head)
+                    .foregroundStyle(m.folder == nil ? .secondary : .primary)
+                Spacer()
+                if m.folder != nil { Button("Rescan") { m.rescan() }.disabled(m.isScanning) }
+                Button("Choose Folder…", action: chooseFolder).disabled(m.isScanning)
+            }
+            Divider()
+            if m.isScanning {
+                HStack { ProgressView().controlSize(.small); Text(m.status) }
+                Spacer()
+            } else if let r = m.report {
+                report(r)
+            } else {
+                Text("The report shows which games are converted, which aren't, originals you can clean up, multi-disc games with a disc missing, and ones without a playlist. Nothing is changed until you click an action.")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            if !m.message.isEmpty { Text(m.message).font(.callout) }
+            HStack {
+                Spacer()
+                Button("Back to Converterator") { openWindow(id: "main"); dismissWindow(id: "library") }
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 640, minHeight: 520)
+    }
+
+    private func report(_ r: LibraryReport) -> some View {
+        List {
+            Section {
+                row("CHDs", "\(r.chds.count) · \(formatBytes(r.chdBytes))")
+                if !redump.index.isEmpty {
+                    row("Named as in Redump", "\(r.redumpNamed) of \(r.chds.count)")
+                }
+            } header: { Text("Summary") }
+
+            Section {
+                if r.unconverted.isEmpty { Text("Everything here is converted.").foregroundStyle(.secondary) }
+                ForEach(r.unconverted.prefix(200), id: \.self) { fileRow($0, detail: formatBytes(totalSize(Converter.sourceFiles(for: $0)))) }
+                more(r.unconverted.count)
+            } header: {
+                header("Not converted yet: \(r.unconverted.count)", r.unconverted.isEmpty ? nil : formatBytes(r.unconvertedBytes),
+                       action: r.unconverted.isEmpty || c.isRunning ? nil : ("Add All to Converter", {
+                    c.add(r.unconverted); openWindow(id: "main")
+                }))
+            }
+
+            Section {
+                if r.leftovers.isEmpty { Text("No leftover originals.").foregroundStyle(.secondary) }
+                ForEach(r.leftovers.prefix(200)) { item in
+                    fileRow(item.source, detail: "\(formatBytes(item.bytes)) · has \(item.chds.count == 1 ? item.chds[0].lastPathComponent : "\(item.chds.count) CHDs")")
+                }
+                more(r.leftovers.count)
+            } header: {
+                header("Originals that already have CHDs: \(r.leftovers.count)", r.leftovers.isEmpty ? nil : formatBytes(r.leftoverBytes),
+                       action: r.leftovers.isEmpty ? nil : ("Clean Up…", {
+                    if let f = m.folder { Cleanup.shared.scan(f) }
+                    openWindow(id: "cleanup")
+                }))
+            }
+
+            Section {
+                if r.missingDiscs.isEmpty { Text("No multi-disc games with a disc missing.").foregroundStyle(.secondary) }
+                ForEach(r.missingDiscs) { set in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(set.name).lineLimit(1).truncationMode(.middle)
+                        Text("Has disc \(set.have.map(String.init).joined(separator: ", ")); missing \(set.missing.map(String.init).joined(separator: ", "))\(set.fromRedump ? " (Redump lists \(set.expected))" : "") · \(set.dir.lastPathComponent)")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    .contextMenu { Button("Show in Finder") { NSWorkspace.shared.open(set.dir) } }
+                }
+            } header: { header("Multi-disc games with a disc missing: \(r.missingDiscs.count)", nil, action: nil) }
+
+            Section {
+                if r.needsPlaylist.isEmpty { Text("Every multi-disc game has a playlist.").foregroundStyle(.secondary) }
+                ForEach(r.needsPlaylist) { set in
+                    fileRow(set.discs[0], title: set.name + ".m3u",
+                            detail: "\(set.discs.count) discs · \(set.dir.lastPathComponent)")
+                }
+            } header: {
+                header("Multi-disc games without a playlist: \(r.needsPlaylist.count)", nil,
+                       action: r.needsPlaylist.isEmpty ? nil : ("Make Playlists", { m.makePlaylists() }))
+            }
+
+            Section {
+                Text(redump.index.isEmpty
+                     ? "Load Redump DATs in Settings to check your CHDs."
+                     : "Unpacks and checks each CHD; it takes a while for a big folder.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: {
+                header("Check CHDs against Redump", nil, action: r.chds.isEmpty || redump.index.isEmpty ? nil : ("Check \(r.chds.count) CHDs…", {
+                    CHDCheck.shared.add(r.chds); openWindow(id: "chdcheck")
+                }))
+            }
+        }
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack { Text(label); Spacer(); Text(value).foregroundStyle(.secondary).monospacedDigit() }
+    }
+
+    private func header(_ title: String, _ size: String?, action: (String, () -> Void)?) -> some View {
+        HStack {
+            Text(title)
+            if let size { Text(size).foregroundStyle(.secondary) }
+            Spacer()
+            if let action { Button(action.0, action: action.1).textCase(nil) }
+        }
+    }
+
+    private func fileRow(_ url: URL, title: String? = nil, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title ?? url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+            Text(detail + " · " + url.deletingLastPathComponent().lastPathComponent).font(.caption).foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+        }
+        .contextMenu { Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) } }
+    }
+
+    @ViewBuilder private func more(_ count: Int) -> some View {
+        if count > 200 { Text("…and \(count - 200) more").font(.caption).foregroundStyle(.secondary) }
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.prompt = "Scan"
+        panel.message = "Choose a folder of games to report on (subfolders are included)"
+        let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK, let url = panel.url { m.scan(url) } }
+        if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
     }
 }
 
@@ -2745,6 +3139,8 @@ struct ConverteratorApp: App {
             .commands { AppCommands() }
         Window("Clean Up Originals", id: "cleanup") { CleanupView() }
             .defaultSize(width: 640, height: 520)
+        Window("Library Report", id: "library") { LibraryView() }
+            .defaultSize(width: 720, height: 640)
         Window("Check CHDs Against Redump", id: "chdcheck") { CHDCheckView() }
             .defaultSize(width: 680, height: 540)
         Settings { SettingsView() }
@@ -2774,6 +3170,7 @@ struct AppCommands: Commands {
             Divider()
             Button("Clean Up Originals…") { openWindow(id: "cleanup") }
             Button("Check CHDs Against Redump…") { openWindow(id: "chdcheck") }
+            Button("Library Report…") { openWindow(id: "library") }
         }
         CommandMenu("Convert") {
             Button("Convert") { c.start() }
