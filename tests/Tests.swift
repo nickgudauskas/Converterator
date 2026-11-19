@@ -183,14 +183,16 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         k.add([ck])
         k.start(); while k.isRunning { try? await Task.sleep(for: .milliseconds(100)) }
         func item(_ n: String) -> CHDCheck.Item? { k.items.first { $0.url.lastPathComponent == n } }
-        check(item("game.chd")?.result?.isMatch == true, "CD CHD matches")
-        check(item("ps2.chd")?.result?.isMatch == true, "DVD CHD matches")
+        func why(_ n: String) -> String { item(n).map { "\($0.state): \($0.result?.long ?? $0.error ?? "no result")" } ?? "missing" }
+        check(item("game.chd")?.result?.isMatch == true, "CD CHD matches", why("game.chd"))
+        check(item("ps2.chd")?.result?.isMatch == true, "DVD CHD matches", why("ps2.chd"))
         check(item("gd.chd")?.result?.isMatch == true, "Dreamcast GD-ROM CHD matches (Redump layout, gaps included)", item("gd.chd")?.result?.long ?? item("gd.chd")?.error ?? "")
         if case .partial(_, 1, 2) = item("two.chd")?.result { check(true, "partial match reported") } else { check(false, "partial match reported", item("two.chd")?.result?.long ?? "") }
         check(item("bad.chd")?.state == .failed, "damaged CHD fails", item("bad.chd")?.error ?? "")
         // Second run: unchanged CHDs come from memory
         k.clear(); k.add([ck]); k.start(); while k.isRunning { try? await Task.sleep(for: .milliseconds(100)) }
-        check(item("game.chd")?.remembered == true && item("gd.chd")?.remembered == true, "unchanged CHDs aren't unpacked again")
+        check(item("game.chd")?.remembered == true && item("gd.chd")?.remembered == true, "unchanged CHDs aren't unpacked again",
+              "game: \(why("game.chd")), remembered \(item("game.chd")?.remembered ?? false); gd remembered \(item("gd.chd")?.remembered ?? false)")
         check(item("bad.chd")?.remembered == false, "failed checks aren't remembered")
         k.renameMatches()
         check(exists(ck.appendingPathComponent("Good Game (USA).chd")) && exists(ck.appendingPathComponent("GD Game (USA).chd")), "matches renamed")
