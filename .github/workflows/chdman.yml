@@ -65,7 +65,8 @@ jobs:
           chmod +x chdman
           lipo -info chdman
           # Nothing outside macOS itself may be linked.
-          if otool -L chdman | tail -n +2 | grep -vE "^\s*/(System/Library|usr/lib)/"; then
+          # (otool prints a header per architecture; only the indented lines are libraries.)
+          if otool -L chdman | grep -E "^\s+/" | grep -vE "^\s+/(System/Library|usr/lib)/"; then
             echo "chdman links a library that isn't part of macOS"; exit 1
           fi
           ./chdman | head -1
