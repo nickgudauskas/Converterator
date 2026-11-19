@@ -69,12 +69,15 @@ struct AppCommands: Commands {
             Button("Library Report…") { openWindow(id: "library") }
         }
         CommandMenu("Convert") {
-            Button("Convert") { c.start() }
+            Button(c.isPaused ? "Resume" : "Convert") { NotificationCenter.default.post(name: .startConverting, object: nil) }
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(c.isRunning || !c.toolsReady || !c.hasQueued)
+            Button("Pause After This File") { c.pause() }
+                .keyboardShortcut("p")
+                .disabled(!c.isRunning)
             Button("Stop Converting…") { NotificationCenter.default.post(name: .stopConverting, object: nil) }
                 .keyboardShortcut(".")
-                .disabled(!c.isRunning)
+                .disabled(!c.isRunning && !c.isPaused)
             Divider()
             Button("Clear Finished") { c.clearFinished() }
                 .keyboardShortcut("k")

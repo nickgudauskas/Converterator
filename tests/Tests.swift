@@ -228,6 +228,69 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         let (clear, skipped) = Cleanup.unambiguous(amb.filter { $0.source.path.contains("/amb") })
         check(clear.isEmpty && skipped == 2, "files sharing one CHD name are left out of cleanup")
 
+        // MARK: Pause and the saved queue
+        section("Pause, Resume and the saved queue")
+        let pz = W.appendingPathComponent("pause"); try? fm.createDirectory(at: pz, withIntermediateDirectories: true)
+        for n in 1...3 {
+            try! fm.copyItem(at: F.appendingPathComponent("cd/game.bin"), to: pz.appendingPathComponent("p\(n).bin"))
+            try! "FILE \"p\(n).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n"
+                .write(to: pz.appendingPathComponent("p\(n).cue"), atomically: true, encoding: .utf8)
+        }
+        c.clearAll(); c.add([pz]); c.start()
+        while !c.jobs.contains(where: { $0.state == .working }) { try? await Task.sleep(for: .milliseconds(10)) }
+        c.pause()
+        while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(c.isPaused && c.batchDoneCount == 1 && c.batchQueuedCount == 2, "Pause stops after the current file",
+              "paused \(c.isPaused), done \(c.batchDoneCount), waiting \(c.batchQueuedCount)")
+        let saved = Converter.loadQueue(from: Converter.queueFile)
+        check(saved.count == 3 && saved.filter { $0.state == .queued }.count == 2, "the list is saved as it changes")
+        c.start()
+        while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(!c.isPaused && c.batchDoneCount == 3 && c.batchJobs.count == 3, "Resume finishes the same batch")
+
+        let slow = workspace("slow", from: F, ["slow/slow.cue", "slow/slow.bin"], into: W)
+        c.clearAll(); c.add([slow.appendingPathComponent("slow.cue")]); c.start()
+        while c.jobs.first?.progress ?? 0 < 0.01 && c.isRunning { try? await Task.sleep(for: .milliseconds(20)) }
+        c.pause(now: true)
+        while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(c.isPaused && c.jobs.first?.state == .queued && !exists(slow.appendingPathComponent("slow.chd")),
+              "Pause Now puts the file back and deletes its unfinished CHD", c.jobs.first?.detail ?? "")
+        c.cancel()
+        check(!c.isPaused && c.batchEnd != nil, "Cancel ends a paused batch")
+
+        // A list saved while a file was converting comes back with that file waiting again.
+        let qf = W.appendingPathComponent("queue-test.json")
+        let fake = [Converter.SavedJob(path: "/a.cue", state: "done", detail: "a.chd", weight: 1, bytesIn: 0, bytesOut: 0, outputs: []),
+                    Converter.SavedJob(path: "/b.cue", state: "working", detail: "Compressing — 40%", weight: 1, bytesIn: 0, bytesOut: 0, outputs: [])]
+        try! JSONEncoder().encode(fake).write(to: qf)
+        let back = Converter.loadQueue(from: qf)
+        check(back.map(\.state) == [.done, .queued] && back[1].detail.contains("interrupted"), "an interrupted file is waiting again after a restart")
+
+        // A file that's gone (drive unplugged) fails with a clear message
+        let gone = W.appendingPathComponent("gone/away.iso")
+        c.clearAll(); c.jobs = [Job(url: gone)]; c.start()
+        while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(c.jobs.first?.detail.contains("Can't find the file") == true, "missing file says to connect the drive", c.jobs.first?.detail ?? "")
+
+        // MARK: Free space
+        section("Free space")
+        check(Converter.logicalSize("Logical size: 1,411,200 bytes") == 1_411_200, "reads chdman's logical size")
+        DiskSpace.override = { _ in 1_000_000 }   // pretend every disk has 1 MB free
+        let full = workspace("full", from: F, ["cd/game.cue", "cd/game.bin"], into: W)
+        c.clearAll(); c.add([full.appendingPathComponent("game.cue")])
+        check(c.batchSpaceWarning()?.contains("may need up to") == true, "warns before starting a batch that may not fit")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(c.jobs.first?.state == .failed && c.jobs.first?.detail.contains("Not enough free space") == true,
+              "a file that won't fit fails before starting", c.jobs.first?.detail ?? "")
+        check(!exists(full.appendingPathComponent("game.chd")), "nothing written")
+        let tight = await CHDCheck.check(F.appendingPathComponent("chd/game.chd"), chdman: c.chdman!, index: db.index,
+                                         started: { _ in }, progress: { _ in })
+        if case .failure(let e) = tight { check(e.message.contains("to unpack it"), "CHD check warns when there's no room to unpack") }
+        else { check(false, "CHD check warns when there's no room to unpack") }
+        DiskSpace.override = nil
+        check(c.batchSpaceWarning() == nil, "no warning when there's room")
+        c.clearAll()
+
         // MARK: Updater
         section("Updater checks")
         let zip = repo.appendingPathComponent("dist/Converterator.zip")

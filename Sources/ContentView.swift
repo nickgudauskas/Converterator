@@ -12,6 +12,7 @@ extension Notification.Name {
     static let addFiles = Notification.Name("ConverteratorAddFiles")
     static let stopConverting = Notification.Name("ConverteratorStopConverting")
     static let toggleLog = Notification.Name("ConverteratorToggleLog")
+    static let startConverting = Notification.Name("ConverteratorStartConverting")
 }
 
 struct ContentView: View {
@@ -21,10 +22,13 @@ struct ContentView: View {
     @State private var showLog = false
     @State private var confirmCancel = false
     @State private var selection = Set<UUID>()
+    @State private var confirmSpace = false
+    @State private var spaceWarning = ""
 
     var body: some View {
         VStack(spacing: 0) {
             if !c.toolsReady { missingToolsBanner }
+            if c.restoredCount > 0 && !c.isRunning { restoredBanner }
 
             Group {
                 if c.jobs.isEmpty { dropPrompt } else { jobList }
@@ -67,9 +71,15 @@ struct ContentView: View {
             bottomBar.padding(.horizontal, 14).padding(.vertical, 10)
         }
         .frame(minWidth: 560, minHeight: 420)
+        .alert("There may not be enough free space", isPresented: $confirmSpace) {
+            Button("Convert Anyway") { c.start() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(spaceWarning)
+        }
         .alert("Stop converting?", isPresented: $confirmCancel) {
             Button("Stop Converting", role: .destructive) {
-                if c.isRunning { c.cancel() }   // the batch may have finished while the dialog was open
+                if c.isRunning || c.isPaused { c.cancel() }   // the batch may have finished while the dialog was open
             }
             Button("Keep Converting", role: .cancel) {}
         } message: {
@@ -90,8 +100,9 @@ struct ContentView: View {
             if !c.isRunning { pickFiles() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .stopConverting)) { _ in
-            if c.isRunning { confirmCancel = true }
+            if c.isRunning || c.isPaused { confirmCancel = true }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .startConverting)) { _ in startConverting() }
         .onReceive(NotificationCenter.default.publisher(for: .toggleLog)) { _ in showLog.toggle() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             c.recheckTools()
@@ -129,6 +140,9 @@ struct ContentView: View {
         if c.isRunning {
             status = "Converting file \(min(finished + 1, total)) of \(total)"
             timeText = c.batchTimeRemaining(now: now).map(Converter.describeRemaining) ?? "Estimating time left…"
+        } else if c.isPaused {
+            status = "Paused: \(finished) of \(total) done"
+            timeText = "Click Resume to carry on with the rest."
         } else {
             status = "Batch finished: " + c.batchCountsText
             var parts: [String] = []
@@ -319,13 +333,51 @@ struct ContentView: View {
             .font(.caption)
                 .padding(.trailing, 6)
             if c.isRunning {
+                Menu("Pause") {
+                    Button("Pause After This File") { c.pause() }
+                    Button("Pause Now") { c.pause(now: true) }
+                } primaryAction: {
+                    c.pause()
+                }
+                .fixedSize()
+                .help("Pause after the current file. Pause Now stops it straight away, and it starts again from the beginning when you resume.")
                 Button("Cancel", role: .cancel) { confirmCancel = true }
+            } else if c.isPaused {
+                Button("Cancel", role: .cancel) { confirmCancel = true }
+                Button("Resume", action: startConverting)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!c.toolsReady)
             } else {
-                Button("Convert", action: c.start)
+                Button("Convert", action: startConverting)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!c.toolsReady || !c.hasQueued)
             }
         }
+    }
+
+    /// Starts (or resumes), first warning if the waiting files may not fit on their disks.
+    private func startConverting() {
+        guard !c.isRunning, c.toolsReady, c.hasQueued else { return }
+        c.restoredCount = 0
+        if !c.isPaused, let warning = c.batchSpaceWarning() {
+            spaceWarning = warning
+            confirmSpace = true
+        } else {
+            c.start()
+        }
+    }
+
+    /// Shown at launch when files were waiting in the list last time the app closed.
+    private var restoredBanner: some View {
+        HStack {
+            Label("Picked up where you left off: \(c.restoredCount) file\(c.restoredCount == 1 ? "" : "s") still to convert. Click Convert to carry on.",
+                  systemImage: "arrow.clockwise.circle")
+            Spacer()
+            Button("Dismiss") { c.restoredCount = 0 }
+        }
+        .font(.callout)
+        .padding(10)
+        .background(Color.accentColor.opacity(0.10))
     }
 
     /// Removes rows from the list (never the one converting), and drops them from the selection.

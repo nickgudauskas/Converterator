@@ -9,9 +9,15 @@ import CryptoKit
 final class Converter: ObservableObject {
     static let shared = Converter()
 
-    @Published var jobs: [Job] = []
+    @Published var jobs: [Job] = [] {
+        didSet { saveQueueIfChanged() }
+    }
     @Published var log: String = ""
     @Published var isRunning = false
+    /// A batch stopped with Pause: not running, but its remaining files are still waiting.
+    @Published private(set) var isPaused = false
+    /// Files put back in the list from last time (shown once, until dismissed).
+    @Published var restoredCount = 0
     @Published var outputDir: URL? {
         didSet { UserDefaults.standard.set(outputDir?.path, forKey: "outputDir") }
     }
@@ -55,6 +61,9 @@ final class Converter: ObservableObject {
     @Published var trashSources = false
 
     private var cancelRequested = false
+    private var pauseRequested = false
+    private var pauseNow = false
+    private var pausedAt: Date?
 
     init() {
         let d = UserDefaults.standard
@@ -66,6 +75,7 @@ final class Converter: ObservableObject {
         verify = d.bool(forKey: "verify")
         isoMode = ISOMode(rawValue: d.string(forKey: "isoMode") ?? "") ?? .automatic
         startFromFinder = d.object(forKey: "startFromFinder") as? Bool ?? true
+        restoreQueue()
     }
 
     /// chdman is needed for everything; PSXPackager only for .pbp files (checked per job).
@@ -159,7 +169,7 @@ final class Converter: ObservableObject {
         }
         jobs += newJobs
         // Files added mid-run join the current batch.
-        if isRunning { batchIDs += newJobs.filter { $0.state == .queued }.map(\.id) }
+        if isRunning || isPaused { batchIDs += newJobs.filter { $0.state == .queued }.map(\.id) }
         if found.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso, .chd, .zip or .7z files found in what was added.") }
     }
 
@@ -173,6 +183,60 @@ final class Converter: ObservableObject {
             jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil; jobs[i].fraction = 0
             jobs[i].bytesIn = 0; jobs[i].bytesOut = 0; jobs[i].outputs = []
         }
+    }
+
+    // MARK: Saved queue
+
+    /// What's kept of a job between launches.
+    struct SavedJob: Codable {
+        let path: String
+        let state: String
+        let detail: String
+        let weight: Double
+        let bytesIn: Double
+        let bytesOut: Double
+        let outputs: [String]
+    }
+
+    nonisolated static var queueFile: URL { AppPaths.dataDir.appendingPathComponent("queue.json") }
+    private var savedSignature = ""
+
+    /// Saves the list whenever a file is added, removed, or changes state (not on every progress tick).
+    private func saveQueueIfChanged() {
+        let signature = jobs.map { "\($0.id)\($0.state)" }.joined(separator: ",")
+        guard signature != savedSignature else { return }
+        savedSignature = signature
+        let saved = jobs.map { j in
+            SavedJob(path: j.url.path, state: "\(j.state)", detail: j.detail, weight: j.weight,
+                     bytesIn: j.bytesIn, bytesOut: j.bytesOut, outputs: j.outputs.map(\.path))
+        }
+        try? FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(saved).write(to: Converter.queueFile, options: .atomic)
+    }
+
+    /// Jobs from a saved list. One that was converting when the app quit (or crashed) is waiting again.
+    nonisolated static func loadQueue(from file: URL) -> [Job] {
+        guard let data = try? Data(contentsOf: file),
+              let saved = try? JSONDecoder().decode([SavedJob].self, from: data) else { return [] }
+        return saved.map { s in
+            var j = Job(url: URL(fileURLWithPath: s.path))
+            switch s.state {
+            case "done": j.state = .done; j.detail = s.detail
+            case "failed": j.state = .failed; j.detail = s.detail
+            default: j.state = .queued; j.detail = s.state == "working" ? "Waiting (interrupted last time)" : "Waiting"
+            }
+            j.weight = s.weight; j.bytesIn = s.bytesIn; j.bytesOut = s.bytesOut
+            j.outputs = s.outputs.map { URL(fileURLWithPath: $0) }
+            j.timed = j.state == .queued
+            return j
+        }
+    }
+
+    private func restoreQueue() {
+        let restored = Converter.loadQueue(from: Converter.queueFile)
+        guard !restored.isEmpty else { return }
+        jobs = restored
+        restoredCount = restored.filter { $0.state == .queued }.count
     }
 
     // MARK: Batch progress
@@ -261,30 +325,76 @@ final class Converter: ObservableObject {
     }
 
     func cancel() {
+        if isPaused {
+            // Ending a paused batch: nothing is running, so just close it off.
+            isPaused = false; pausedAt = nil; batchEnd = Date()
+            append("— Cancelled —")
+            return
+        }
         cancelRequested = true
         currentProcess?.terminate()
     }
 
+    /// Pauses the batch after the current file, or right away (`now`), in which case the current file
+    /// is stopped, its unfinished CHD deleted, and it goes back in the list to be done again on Resume.
+    func pause(now: Bool = false) {
+        guard isRunning else { return }
+        pauseRequested = true
+        if now { pauseNow = true; cancelRequested = true; currentProcess?.terminate() }
+    }
+
     // MARK: Conversion
 
+    /// Converts everything waiting in the list, or carries on with a paused batch.
     func start() {
+        if isPaused { resume(); return }
         guard !isRunning, toolsReady else { return }
-        isRunning = true
-        cancelRequested = false
         batchIDs = jobs.filter { $0.state == .queued }.map(\.id)
         batchStart = Date()
         batchEnd = nil
+        runQueue()
+    }
+
+    private func resume() {
+        guard isPaused, toolsReady else { return }
+        // Leave the paused time out of the time-remaining estimate.
+        if let p = pausedAt, let s = batchStart { batchStart = s.addingTimeInterval(Date().timeIntervalSince(p)) }
+        isPaused = false
+        pausedAt = nil
+        append("— Resumed —")
+        runQueue()
+    }
+
+    private func runQueue() {
+        isRunning = true
+        cancelRequested = false
+        pauseRequested = false
+        pauseNow = false
         // Stop the Mac from idle-sleeping mid-batch. The display can still sleep; closing a laptop lid still sleeps.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Converting disc images")
         Notifier.requestPermission()
         Task {
-            while !cancelRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
+            var last: UUID?
+            while !cancelRequested && !pauseRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
+                last = jobs[i].id
                 if jobs[i].isExtraction { await extract(index: i) } else { await convert(index: i) }
             }
-            batchEnd = Date()
             isRunning = false
             if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
+            if pauseNow, let last {
+                // Paused mid-file: put it back to be done again from the start.
+                update(last) { $0.state = .queued; $0.detail = "Waiting"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
+                append("  put back in the list for when you resume")
+            }
+            if pauseRequested && hasQueued {
+                isPaused = true
+                pausedAt = Date()
+                cancelRequested = false
+                append("— Paused —")
+                return
+            }
+            batchEnd = Date()
             writePlaylists()
             append(cancelRequested ? "— Cancelled —" : "— All done —")
             if !cancelRequested {
@@ -331,8 +441,21 @@ final class Converter: ObservableObject {
 
         update(id) { $0.state = .working; $0.detail = "Starting…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
         append("▶ \(src.lastPathComponent)")
+        guard fm.fileExists(atPath: src.path) else {
+            return fail("Can't find the file. If it's on an external drive, connect it, then use Clear → Retry Failed.")
+        }
         do { try fm.createDirectory(at: outDir, withIntermediateDirectories: true) }
         catch { return fail("Can't create folder: \(error.localizedDescription)") }
+        // Room for the CHD, and for temporary files (unpacked PBPs and archives). Skipped when the CHD is
+        // already there and won't be rewritten.
+        let alreadyThere = !overwrite && Converter.inputExtensions.contains(src.pathExtension.lowercased())
+            && src.pathExtension.lowercased() != "pbp"
+            && fm.fileExists(atPath: outDir.appendingPathComponent(src.deletingPathExtension().lastPathComponent + ".chd").path)
+        if !alreadyThere {
+            let need = Converter.spaceNeeded(for: src)
+            if let p = DiskSpace.problem(needs: need.output, at: outDir) { return fail(p) }
+            if let p = DiskSpace.problem(needs: need.temp, at: fm.temporaryDirectory) { return fail(p + " for temporary files") }
+        }
 
         // The games to compress: the file itself, or every disc image inside a .zip/.7z.
         var games = [src]
@@ -590,7 +713,11 @@ final class Converter: ObservableObject {
 
     /// File names inside a .zip, read from its central directory without unpacking it.
     /// Nil if it can't be read (for example a ZIP64 archive), so the caller can decide what to do.
-    nonisolated static func zipEntryNames(_ url: URL) -> [String]? {
+    nonisolated static func zipEntryNames(_ url: URL) -> [String]? { zipEntries(url)?.map(\.name) }
+
+    /// File names and unpacked sizes inside a .zip, from its central directory. A size is nil when it's
+    /// stored in ZIP64 form.
+    nonisolated static func zipEntries(_ url: URL) -> [(name: String, size: Double?)]? {
         guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? h.close() }
         guard let size = try? h.seekToEnd(), size >= 22 else { return nil }
@@ -605,14 +732,62 @@ final class Converter: ObservableObject {
         guard cdOffset != 0xFFFFFFFF, cdSize > 0, cdSize < 64 << 20, UInt64(cdOffset + cdSize) <= size else { return nil }
         guard (try? h.seek(toOffset: UInt64(cdOffset))) != nil, let cdData = try? h.read(upToCount: cdSize) else { return nil }
         let cd = [UInt8](cdData)
-        var names: [String] = [], i = 0
+        var entries: [(name: String, size: Double?)] = [], i = 0
         while i + 46 <= cd.count, le32(cd, i) == 0x02014b50 {
             let n = le16(cd, i + 28), x = le16(cd, i + 30), c = le16(cd, i + 32)
             guard i + 46 + n <= cd.count else { break }
-            names.append(String(decoding: cd[(i + 46)..<(i + 46 + n)], as: UTF8.self))
+            let unpacked = le32(cd, i + 24)
+            entries.append((String(decoding: cd[(i + 46)..<(i + 46 + n)], as: UTF8.self),
+                            unpacked == 0xFFFFFFFF ? nil : Double(unpacked)))
             i += 46 + n + x + c
         }
-        return names
+        return entries
+    }
+
+    // MARK: Free space
+
+    /// Upper estimates of what converting `src` needs: on the output disk, and on the Mac's disk for
+    /// temporary files. CHDs are nearly always smaller than their discs; a PBP is unpacked first and its
+    /// CHD can be bigger than the PBP; an archive is unpacked first.
+    nonisolated static func spaceNeeded(for src: URL) -> (output: Double, temp: Double) {
+        let size = totalSize(sourceFiles(for: src))
+        switch src.pathExtension.lowercased() {
+        case "pbp": return (size * 1.5, size * 3)
+        case "zip":
+            let entries = zipEntries(src) ?? []
+            let unpacked = entries.allSatisfy({ $0.size != nil }) && !entries.isEmpty
+                ? entries.reduce(0) { $0 + ($1.size ?? 0) } : size * 4
+            return (unpacked, unpacked)
+        case "7z": return (size * 4, size * 4)
+        case "chd": return (0, 0)   // known once chdman has read it
+        default: return (size, 0)
+        }
+    }
+
+    /// A warning if the waiting files may not fit, per disk, or nil. Converting can still go ahead:
+    /// each file is checked again just before it starts, and only the ones that don't fit fail.
+    func batchSpaceWarning() -> String? {
+        var needs: [String: (url: URL, bytes: Double)] = [:]
+        var biggestTemp = 0.0
+        for j in jobs where j.state == .queued {
+            let n = Converter.spaceNeeded(for: j.url)
+            let out = outputDir ?? j.url.deletingLastPathComponent()
+            let key = DiskSpace.volumeID(out)
+            needs[key] = (out, (needs[key]?.bytes ?? 0) + n.output)
+            biggestTemp = max(biggestTemp, n.temp)   // temporary files are deleted after each file
+        }
+        var lines: [String] = []
+        for (_, n) in needs.sorted(by: { $0.key < $1.key }) {
+            if let free = DiskSpace.free(at: n.url), free < n.bytes + DiskSpace.margin {
+                lines.append("These files may need up to \(formatBytes(n.bytes)) on \(DiskSpace.volumeName(n.url)), which has \(formatBytes(free)) free.")
+            }
+        }
+        if let p = DiskSpace.problem(needs: biggestTemp, at: FileManager.default.temporaryDirectory) {
+            lines.append("The biggest file needs room for temporary files on your Mac's disk. \(p).")
+        }
+        guard !lines.isEmpty else { return nil }
+        return lines.joined(separator: "\n\n")
+            + "\n\nCHDs are usually much smaller than these upper estimates. If you go ahead, each file is checked again before it starts, and any that don't fit are marked failed."
     }
 
     /// Whether a folder scan should pick up this archive: only if it has a disc image inside, so a folder
@@ -715,6 +890,13 @@ final class Converter: ObservableObject {
         return stalled ? Converter.stalledStatus : status
     }
 
+    /// The unpacked size from a `chdman info` line: "Logical size: 1,411,200 bytes".
+    nonisolated static func logicalSize(_ line: String) -> Double? {
+        guard line.hasPrefix("Logical size") else { return nil }
+        let digits = line.drop { !$0.isNumber }.prefix { $0.isNumber || $0 == "," }.filter(\.isNumber)
+        return Double(digits)
+    }
+
     // MARK: CHD → BIN/CUE
 
     /// Unpacks a CHD back to what it was made from: BIN/CUE for a CD, GDI and tracks for a
@@ -734,15 +916,20 @@ final class Converter: ObservableObject {
 
         update(id) { $0.state = .working; $0.detail = "Reading CHD…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
         append("▶ \(src.lastPathComponent)")
+        guard fm.fileExists(atPath: src.path) else {
+            return fail("Can't find the file. If it's on an external drive, connect it, then use Clear → Retry Failed.")
+        }
         do { try fm.createDirectory(at: outDir, withIntermediateDirectories: true) }
         catch { return fail("Can't create folder: \(error.localizedDescription)") }
 
         // `chdman info` lists metadata tags: CHT2/CHCD/CHTR = CD, CHGD/CHGT = GD-ROM, "DVD " = DVD.
         var tags: [String] = []
+        var logical = 0.0
         let s0 = await run(chdman!, ["info", "-i", src.path]) { [weak self] line in
             if let r = line.range(of: #"Tag='[^']{4}'"#, options: .regularExpression) {
                 tags.append(String(line[r].dropFirst(5).prefix(4)))
             }
+            if let size = Converter.logicalSize(line) { logical = size }
             if line.hasPrefix("Error") { self?.append("  [chdman] \(line)") }
         }
         if cancelRequested { return fail("Cancelled") }
@@ -765,6 +952,7 @@ final class Converter: ObservableObject {
             return
         }
 
+        if let p = DiskSpace.problem(needs: logical, at: outDir) { return fail(p) }
         var args = [command, "-i", src.path, "-o", out.path]
         if overwrite { args.append("-f") }
         let s1 = await runChdman(args, id: id, label: "Extracting") { $0 }

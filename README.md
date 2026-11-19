@@ -60,8 +60,11 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
   - how many CHDs match Redump, don't match, or haven't been checked yet (from remembered results, so nothing is unpacked), with **Check Unchecked…**
 - **Clean up originals.** For folders you converted without the Trash option: choose **File → Clean Up Originals…**, pick a folder, and Converterator lists every disc image (and zip or 7z of them) that already has its CHD next to it, or in your **Save to:** folder. A multi-disc PBP counts when every CHD in its `.m3u` is there. CHDs renamed after Redump are found too, from a record Converterator keeps of what it converted. Untick anything you want to keep and click **Move to Trash**. With **Verify each CHD before moving its originals** on (the default), each CHD is checked with `chdman verify` first, and anything whose CHD fails stays. If two files would share one CHD name (say, many `Disc 1.cue` files and one shared **Save to:** folder), they're left out, since it's unclear which one the CHD came from.
 - **Optional cleanup.** Turn on **Move source files to Trash after a successful conversion** to clear out the originals. That's the `.pbp`, `.cue`, `.gdi` or `.iso`, plus any `.bin` or track files a `.cue` or `.gdi` lists. When extracting, it's the `.chd`. Files go to the Trash, so they can be restored, and only after every CHD for that game was newly written. If a CHD already existed and was skipped, the originals stay. The option turns itself off each time the app starts.
+- **Pause and resume.** While converting, **Pause** stops after the current file; **Pause → Pause Now** stops straight away and does that file again from the start when you click **Resume**. The time-remaining estimate leaves the pause out.
+- **The list survives quitting.** The list of files is saved as it changes. If the app is quit, crashes or the Mac restarts mid-batch, it comes back next time with finished files still marked done and the rest waiting (including the one that was interrupted). Click **Convert** to carry on. A file on a drive that isn't connected fails with a note to connect it and use **Clear → Retry Failed**.
+- **Free-space checks.** Before a batch starts, Converterator adds up what the waiting files may need on each disk and warns you if it may not fit, with **Convert Anyway** if you'd like to go ahead. Each file is checked again just before it starts, so one that doesn't fit fails with a clear message ("Not enough free space on EASYROMS: needs up to 4.2 GB, 1.1 GB free") instead of a `chdman` error partway through. Unpacking a PBP, archive or CHD also checks for room for temporary files on your Mac's disk. The estimates are upper limits; CHDs usually take much less.
 - **Cancel and retry.** **Cancel** asks you to confirm, then stops the current file and deletes its unfinished CHD. Finished CHDs and your original files are kept, and files not yet started stay in the list. **Clear → Retry Failed** re-queues only the failures.
-- **Keyboard shortcuts.** ⌘O Add Files, ⌘Return Convert, ⌘. Stop Converting, ⌘K Clear Finished, ⇧⌘K Clear All, ⌘R Retry Failed, ⌘L show or hide the log. Select files in the list (⌘-click or Shift-click for several) and press Delete to remove them.
+- **Keyboard shortcuts.** ⌘O Add Files, ⌘Return Convert or Resume, ⌘P Pause After This File, ⌘. Stop Converting, ⌘K Clear Finished, ⇧⌘K Clear All, ⌘R Retry Failed, ⌘L show or hide the log. Select files in the list (⌘-click or Shift-click for several) and press Delete to remove them.
 - **Log.** **Show Log** displays the full output from PSXPackager and `chdman` for troubleshooting.
 - **Check for updates.** Click **Check for Updates** under the version number, or choose **Converterator → Check for Updates…**. The app asks GitHub for the latest release and, if it's newer, offers **Install and Relaunch**: it downloads the release, checks that it's signed with the same Developer ID and approved by Gatekeeper, replaces itself, and reopens. If anything doesn't check out, nothing is changed and you can download it from GitHub instead. It only checks when you ask and sends nothing about you. (The only other automatic connection is the once-a-day Redump DAT check, which you can turn off.) (Updating from 1.6.0 or earlier still goes through the download page; one-click install works from 1.7.0 on.)
 - Your output folder and option settings are remembered between launches.
@@ -109,6 +112,14 @@ The first build downloads PSXPackager v1.8.0 (the Apple Silicon and Intel builds
 
 It makes small sample disc images (CD, PS2/PSP/plain ISOs, a Dreamcast GD-ROM, zips, a damaged CHD and a Redump DAT that knows some of them), compiles the app's code with `tests/Tests.swift`, and checks conversion, verify, extraction, archives, playlists, Redump matching and renaming, CHD checks and remembered results, Clean Up Originals, the Library Report and the updater's signature checks. It takes about half a minute and needs `chdman`. Add `--network` to also download one real DAT from redump.org. Everything happens in a temporary folder; your settings, Application Support folder and Trash aren't touched.
 
+### Releasing
+
+```bash
+./release.sh 1.12.0 notes.md
+```
+
+It checks you're on `main` with nothing uncommitted and that the version is newer than the latest release, runs the tests (and stops if any fail), sets the version in `build.sh`, builds and notarizes, commits and pushes, publishes the GitHub release with the zip and its SHA-256, then downloads it back and checks the checksum, Gatekeeper and version. Without a notes file, the commit messages since the last release are used. `--dry-run` runs the checks and tests and shows the notes without changing anything. It needs the notarization setup below.
+
 ### Signing and notarizing a release
 
 You need an Apple Developer account with a **Developer ID Application** certificate in your Keychain. Save your notarization login once (it asks for an [app-specific password](https://account.apple.com)):
@@ -148,6 +159,7 @@ swift make_icon.swift
 |---|---|
 | `Sources/` | The app's Swift code, one file per area: `Converter.swift` (the conversion queue, PSXPackager and `chdman`), `Redump.swift` (DATs, matching, downloads, remembered results), `Cleanup.swift`, `CHDCheck.swift`, `LibraryReport.swift`, `Playlist.swift`, `Updates.swift`, the windows (`ContentView.swift`, `SettingsView.swift`) and `App.swift` (entry point, menus, Finder service). |
 | `tests/test.sh`, `tests/Tests.swift` | The tests (see below). |
+| `release.sh` | Tests, builds, notarizes and publishes a release (see below). |
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
 | `notarize.sh` | Builds with Developer ID signing, notarizes with Apple, staples, and zips into `dist/`. |
 | `psxpackager.entitlements` | Hardened-runtime permissions the bundled .NET PSXPackager needs. |

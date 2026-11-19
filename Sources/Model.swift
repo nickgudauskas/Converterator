@@ -17,6 +17,44 @@ enum AppPaths {
     }
 }
 
+/// Free space on the disk holding a folder, and the check made before converting or unpacking.
+enum DiskSpace {
+    /// Lets the tests pretend a disk is full.
+    nonisolated(unsafe) static var override: (@Sendable (URL) -> Double?)?
+    /// Room left over for everything else on the disk.
+    nonisolated static let margin = 200.0 * 1_000_000
+
+    /// The nearest folder that exists, so a not-yet-created output folder still finds its disk.
+    nonisolated static func existing(_ url: URL) -> URL {
+        var u = url
+        while !FileManager.default.fileExists(atPath: u.path) && u.path != "/" { u = u.deletingLastPathComponent() }
+        return u
+    }
+
+    nonisolated static func free(at url: URL) -> Double? {
+        if let override { return override(url) }
+        let v = try? existing(url).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+        if let i = v?.volumeAvailableCapacityForImportantUsage, i > 0 { return Double(i) }
+        return v?.volumeAvailableCapacity.map(Double.init)
+    }
+
+    /// "EASYROMS", or "Macintosh HD".
+    nonisolated static func volumeName(_ url: URL) -> String {
+        (try? existing(url).resourceValues(forKeys: [.volumeLocalizedNameKey]))?.volumeLocalizedName ?? "the disk"
+    }
+
+    /// Which disk a folder is on, for adding up a batch's needs per disk.
+    nonisolated static func volumeID(_ url: URL) -> String {
+        (try? existing(url).resourceValues(forKeys: [.volumeURLKey]))?.volume?.path ?? "/"
+    }
+
+    /// A message if `url`'s disk doesn't have room for `needs` bytes (plus a margin), else nil.
+    nonisolated static func problem(needs: Double, at url: URL) -> String? {
+        guard needs > 0, let free = free(at: url), free < needs + margin else { return nil }
+        return "Not enough free space on \(volumeName(url)): needs up to \(formatBytes(needs)), \(formatBytes(free)) free"
+    }
+}
+
 struct Job: Identifiable {
     enum State { case queued, working, done, failed }
     let id = UUID()

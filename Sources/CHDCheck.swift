@@ -159,6 +159,11 @@ final class CHDCheck: ObservableObject {
 
         let (infoStatus, infoLines) = await ToolRun.run(chdman, ["info", "-i", chd.path], started: started) { _ in }
         guard infoStatus == 0 else { return .failure(CheckError(message: "chdman couldn't read this CHD")) }
+        // Room on the Mac's disk to unpack it.
+        let logical = infoLines.compactMap(Converter.logicalSize).first ?? 0
+        if let p = DiskSpace.problem(needs: logical, at: tmp) {
+            return .failure(CheckError(message: p + " to unpack it. Free up some space and check again."))
+        }
         let tags = infoLines.compactMap { line -> String? in
             guard let r = line.range(of: #"Tag='[^']{4}'"#, options: .regularExpression) else { return nil }
             return String(line[r].dropFirst(5).prefix(4))

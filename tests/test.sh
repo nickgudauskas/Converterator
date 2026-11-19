@@ -40,6 +40,10 @@ dd if=/dev/zero of="$F/big.iso" bs=1 count=1 seek=1000000000 2>/dev/null
 rand "$F/cd/game.bin" $((sector * 600))
 printf 'FILE "game.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n' > "$F/cd/game.cue"
 
+# A bigger one-track CD, so there's time to pause mid-file (about 190 MB, takes chdman a few seconds)
+mkdir -p "$F/slow"; rand "$F/slow/slow.bin" $((sector * 80000))
+printf 'FILE "slow.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n' > "$F/slow/slow.cue"
+
 # A two-track Redump-style CD (data + audio with a gap)
 rand "$F/two/Two (Track 1).bin" $((sector * 400)); rand "$F/two/Two (Track 2).bin" $((sector * 300))
 printf 'FILE "Two (Track 1).bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\nFILE "Two (Track 2).bin" BINARY\n  TRACK 02 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\n' > "$F/two/Two.cue"
