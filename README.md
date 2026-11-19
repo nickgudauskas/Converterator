@@ -26,6 +26,8 @@ Drop files or whole folders in, click **Convert**, and you're done.
 | `.gdi` | Compressed straight to CHD with `chdman`. |
 | `.iso` | Compressed straight to CHD with `chdman`, as a DVD or CD image (see below). |
 | `.zip`, `.7z` | Unpacked to a temporary folder, then every `.pbp`, `.cue`, `.gdi` or `.iso` inside is converted as above. The temporary files are deleted afterwards. `.7z` needs 7-Zip (`brew install sevenzip`). |
+| GameCube and Wii: `.iso`, `.gcm`, `.wbfs`, `.ciso`, `.gcz`, `.wia` | Compressed to **RVZ** (Dolphin's format) with the built-in `dolphin-tool`: zstd level 5, 128 KiB blocks, as Dolphin recommends. GameCube and Wii `.iso` files are recognised from their contents, so they're never made into CHDs. |
+| `.rvz` | Extracted back to a plain `.iso`. |
 | `.chd` | Extracted back to `.cue` + `.bin` (CDs), `.gdi` + tracks (Dreamcast) or `.iso` (DVDs). |
 
 Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
@@ -101,6 +103,7 @@ From 1.13.0, everything it needs is built in, so there's nothing else to install
 That's all. The tools Converterator uses are built into the app:
 - **chdman** (from MAME), in a universal build made from MAME's source code (see [How chdman is built](#how-chdman-is-built)).
 - **PSXPackager**, which carries its own copy of .NET.
+- **dolphin-tool** (from Dolphin), for GameCube and Wii discs, in a universal build made from Dolphin's source (see [How chdman is built](#how-chdman-is-built); dolphin-tool is built the same way).
 - **xdelta3**, for xdelta patches: the project's own dependency-free macOS builds for Apple Silicon and Intel, combined into one.
 
 Converterator uses its built-in chdman. If that's ever missing, it falls back to one installed with Homebrew (`brew install rom-tools`), and if there's none, a banner explains how to install it. Releases before 1.13.0 didn't include chdman and needed the Homebrew one.
@@ -174,6 +177,8 @@ swift make_icon.swift
 |---|---|
 | `Sources/` | The app's Swift code, one file per area: `Converter.swift` (the conversion queue, PSXPackager and `chdman`), `Redump.swift` (DATs, matching, downloads, remembered results), `Cleanup.swift`, `CHDCheck.swift`, `LibraryReport.swift`, `Playlist.swift`, `Updates.swift`, the windows (`ContentView.swift`, `SettingsView.swift`) and `App.swift` (entry point, menus, Finder service). |
 | `tests/test.sh`, `tests/Tests.swift` | The tests (see below). Run on every push by `.github/workflows/tests.yml`, on an Apple Silicon and an Intel Mac. |
+| `.github/workflows/dolphin-tool.yml` | Builds the bundled universal dolphin-tool from Dolphin's source. |
+| `Sources/Nintendo.swift` | GameCube and Wii: recognising discs, RVZ with dolphin-tool. |
 | `.github/workflows/chdman.yml` | Builds the bundled universal chdman from MAME's source (see [How chdman is built](#how-chdman-is-built)). |
 | `release.sh` | Tests, builds, notarizes and publishes a release (see below). |
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
@@ -188,6 +193,7 @@ swift make_icon.swift
 - [PSXPackager](https://github.com/RupertAvery/PSXPackager) by RupertAvery, for PBP extraction.
 - [chdman](https://docs.mamedev.org/tools/chdman.html) from the MAME project, for CHD compression.
 - [xdelta](https://github.com/jmacd/xdelta) by Joshua MacDonald, for applying xdelta patches.
+- [Dolphin](https://dolphin-emu.org)'s `dolphin-tool`, for GameCube and Wii discs (RVZ).
 
 Converterator doesn't modify any of these tools. It runs them as separate programs, and the app includes an unmodified copy of each, which `build.sh` downloads.
 
@@ -197,6 +203,8 @@ MAME's developers only publish chdman for Windows, and Homebrew's copy depends o
 
 To move to a newer MAME: run **Actions → Build chdman → Run workflow** with the new version, then update `CHDMAN_VERSION` and `CHDMAN_SHA256` in `build.sh`.
 
+`dolphin-tool` is built the same way by the [Build dolphin-tool](.github/workflows/dolphin-tool.yml) workflow, because Dolphin's macOS download doesn't include it. The workflow builds just that tool from an official Dolphin release (with its own copies of the libraries it needs, and the GUI, graphics and online features turned off), smoke-tests a GameCube image to RVZ and back on both kinds of Mac, and publishes a `dolphin-tool-…` release with Dolphin's license and a `SOURCE.txt`. `build.sh` checks it against `DOLPHIN_SHA256`.
+
 ## License
 
-Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. xdelta3 is under the Apache License 2.0; its license is included at `Contents/Resources/xdelta3/LICENSE`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.
+Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. dolphin-tool is part of Dolphin, under the GNU General Public License, version 2 or later; its license and `SOURCE.txt` are in `Contents/Resources/dolphin-tool`. xdelta3 is under the Apache License 2.0; its license is included at `Contents/Resources/xdelta3/LICENSE`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.

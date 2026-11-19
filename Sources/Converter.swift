@@ -62,6 +62,8 @@ final class Converter: ObservableObject {
     }
 
     private var currentProcess: Process?
+    /// For tools run through ToolRun, so Cancel can stop them.
+    func setCurrentProcess(_ p: Process) { currentProcess = p }
     /// Keeps the Mac from idle-sleeping while a batch runs.
     private var activity: NSObjectProtocol?
     /// Move source files to the Trash after a successful conversion.
@@ -134,10 +136,10 @@ final class Converter: ObservableObject {
     // MARK: Queue
 
     /// Inputs found when scanning folders. .pbp goes through PSXPackager first; the rest go straight to chdman.
-    nonisolated static let inputExtensions: Set<String> = ["pbp", "cue", "gdi", "iso"]
+    nonisolated static let inputExtensions: Set<String> = ["pbp", "cue", "gdi", "iso", "gcm", "wbfs", "ciso", "gcz", "wia"]
     /// .chd files are extracted back to BIN/CUE, GDI or ISO. Only when added one by one: a folder scan
     /// never picks them up, so re-adding a converted folder doesn't unpack every CHD in it.
-    nonisolated static let extractExtensions: Set<String> = ["chd"]
+    nonisolated static let extractExtensions: Set<String> = ["chd", "rvz"]
 
     func add(_ urls: [URL]) {
         let fm = FileManager.default
@@ -528,7 +530,7 @@ final class Converter: ObservableObject {
             ?? src.deletingPathExtension().lastPathComponent
         let alreadyThere = !overwrite && Converter.inputExtensions.contains(src.pathExtension.lowercased())
             && src.pathExtension.lowercased() != "pbp"
-            && fm.fileExists(atPath: outDir.appendingPathComponent(outName + ".chd").path)
+            && fm.fileExists(atPath: outDir.appendingPathComponent(outName + (Converter.isNintendoDisc(src) ? ".rvz" : ".chd")).path)
         if !alreadyThere {
             let need = Converter.spaceNeeded(for: src, patched: patch != nil)
             // A patched game also needs a temporary patched copy of the track it changes.
@@ -541,13 +543,20 @@ final class Converter: ObservableObject {
         var games = [src]
         var span = (start: 0.0, end: 1.0)
         let unpacked = fm.temporaryDirectory.appendingPathComponent("converterator-\(UUID().uuidString)", isDirectory: true)
-        let isCHDSource = src.pathExtension.lowercased() == "chd"   // only reaches here with a patch
+        let isCHDSource = ["chd", "rvz"].contains(src.pathExtension.lowercased())   // only reaches here with a patch
         defer { if isArchive || isCHDSource { try? fm.removeItem(at: unpacked) } }
         if isCHDSource {
             update(id) { $0.detail = "Unpacking the CHD to patch it…" }
-            switch await Converter.unpackCHD(src, into: unpacked, chdman: chdman!) {
-            case .success(let disc): games = [disc]
-            case .failure(let e): return fail(e.message)
+            if src.pathExtension.lowercased() == "rvz" {
+                let iso = unpacked.appendingPathComponent(src.deletingPathExtension().lastPathComponent + ".iso")
+                try? fm.createDirectory(at: unpacked, withIntermediateDirectories: true)
+                if let err = await dolphinConvert(src, to: iso, rvz: false) { return fail(err) }
+                games = [iso]
+            } else {
+                switch await Converter.unpackCHD(src, into: unpacked, chdman: chdman!) {
+                case .success(let disc): games = [disc]
+                case .failure(let e): return fail(e.message)
+                }
             }
             if cancelRequested { return fail("Cancelled") }
             span = (0.25, 1.0)   // unpacking counts as the first quarter
@@ -652,9 +661,11 @@ final class Converter: ObservableObject {
         // Optional: compare the track files with Redump's list of known good dumps. PBPs are a
         // repackaged format, so their contents never match Redump and aren't checked.
         var redump: RedumpResult?
-        if !isPBP, RedumpDB.shared.active {
+        // (WBFS, CISO, GCZ and WIA hold a GameCube/Wii disc in another form, so they can't be hashed as Redump lists them.)
+        if !isPBP, RedumpDB.shared.active, !["wbfs", "ciso", "gcz", "wia"].contains(src.pathExtension.lowercased()) {
             let index = RedumpDB.shared.index
-            let tracks = src.pathExtension.lowercased() == "iso" ? [src] : Array(Converter.sourceFiles(for: src).dropFirst())
+            let single = ["iso", "gcm"].contains(src.pathExtension.lowercased())
+            let tracks = single ? [src] : Array(Converter.sourceFiles(for: src).dropFirst())
             update(id) { $0.detail = "Checking against Redump…"; $0.progress = 0 }
             let r = await Task.detached {
                 RedumpResult.check(tracks: tracks, index: index) { p in
@@ -777,7 +788,8 @@ final class Converter: ObservableObject {
             let cue = inputs[n]   // the patched copy, if this disc was patched
             let name = cues.count == 1 ? chdBase
                 : applied != nil ? "\(chdBase) (Disc \(n + 1))" : original.deletingPathExtension().lastPathComponent
-            let out = outDir.appendingPathComponent(name + ".chd")
+            let nintendo = Converter.isNintendoDisc(cue)   // GameCube / Wii → RVZ instead of CHD
+            let out = outDir.appendingPathComponent(name + (nintendo ? ".rvz" : ".chd"))
             let disc = cues.count == 1 ? "" : " disc \(n + 1) of \(cues.count)"
             var wroteThisDisc = false
 
@@ -785,6 +797,15 @@ final class Converter: ObservableObject {
                 append("  \(out.lastPathComponent) already exists — skipped (turn on Overwrite to replace)")
                 result.made.append(out)
                 result.skipped += 1
+                update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1 - verifyShare) }
+            } else if nintendo {
+                update(id) { $0.detail = "Compressing \(Converter.nintendoSystem(cue)) disc to RVZ…"; $0.progress = nil }
+                append("  \(Converter.nintendoSystem(cue)) disc: making an RVZ with dolphin-tool")
+                if let err = await dolphinConvert(cue, to: out, rvz: true) { fail(err); return nil }
+                result.made.append(out)
+                result.bytesIn += totalSize([original])
+                result.bytesOut += totalSize([out])
+                wroteThisDisc = true
                 update(id) { $0.fraction = jobFraction(disc: n, discProgress: 1 - verifyShare) }
             } else {
                 // .iso: CD or DVD. Everything else (.cue, .gdi, and PBP extractions) is a CD.
@@ -822,7 +843,14 @@ final class Converter: ObservableObject {
             }
 
             // Optional: check the CHD's checksums, including CHDs that already existed.
-            if verify {
+            if verify && nintendo {
+                update(id) { $0.detail = "Verifying\(disc)…"; $0.progress = nil }
+                if let err = await dolphinVerify(out) {
+                    if wroteThisDisc { try? fm.removeItem(at: out) }
+                    fail(err); return nil
+                }
+                append("  verified \(out.lastPathComponent)")
+            } else if verify {
                 let s3 = await runChdman(["verify", "-i", out.path], id: id, label: "Verifying\(disc)") {
                     jobFraction(disc: n, discProgress: 1 - verifyShare + $0 * verifyShare)
                 }
@@ -1105,6 +1133,7 @@ final class Converter: ObservableObject {
     /// Unpacks a CHD back to what it was made from: BIN/CUE for a CD, GDI and tracks for a
     /// Dreamcast GD-ROM, or ISO for a DVD.
     private func extract(index: Int) async {
+        if jobs[index].url.pathExtension.lowercased() == "rvz" { return await extractRVZ(index: index) }
         let job = jobs[index]
         let id = job.id
         let fm = FileManager.default
@@ -1186,6 +1215,33 @@ final class Converter: ObservableObject {
             $0.state = .done; $0.detail = summary; $0.progress = nil
             $0.bytesIn = job.weight; $0.bytesOut = size
         }
+        append("✓ \(summary)")
+    }
+
+    /// An .rvz back to a plain .iso, with dolphin-tool.
+    private func extractRVZ(index: Int) async {
+        let job = jobs[index], id = job.id, src = job.url, fm = FileManager.default
+        let outDir = outputDir ?? src.deletingLastPathComponent()
+        let out = outDir.appendingPathComponent(src.deletingPathExtension().lastPathComponent + ".iso")
+        func fail(_ msg: String) {
+            update(id) { $0.state = .failed; $0.detail = msg; $0.progress = nil; $0.timed = false }
+            append("✗ \(src.lastPathComponent): \(msg)")
+        }
+        update(id) { $0.state = .working; $0.detail = "Extracting to ISO…"; $0.progress = nil; $0.fraction = 0; $0.timed = true }
+        append("▶ \(src.lastPathComponent)")
+        guard fm.fileExists(atPath: src.path) else { return fail("Can't find the file. If it's on an external drive, connect it, then use Clear → Retry Failed.") }
+        try? fm.createDirectory(at: outDir, withIntermediateDirectories: true)
+        if fm.fileExists(atPath: out.path) && !overwrite {
+            update(id) { $0.state = .done; $0.detail = "\(out.lastPathComponent) · already existed"; $0.timed = false }
+            return
+        }
+        if let p = DiskSpace.problem(needs: totalSize([src]) * 4, at: outDir) { return fail(p) }   // GameCube 1.4 GB, Wii up to 8.5 GB
+        if let err = await dolphinConvert(src, to: out, rvz: false) { return fail(err) }
+        var summary = "\(out.lastPathComponent) · \(formatBytes(totalSize([out])))"
+        if trashSources {
+            do { try fm.trashItem(at: src, resultingItemURL: nil); summary += " · RVZ moved to Trash" } catch {}
+        }
+        update(id) { $0.state = .done; $0.detail = summary; $0.progress = nil; $0.bytesIn = job.weight; $0.bytesOut = totalSize([out]) }
         append("✓ \(summary)")
     }
 

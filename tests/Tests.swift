@@ -455,6 +455,41 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         check(c.jobs.count == 1 && c.jobs.first?.patch?.lastPathComponent == "Base (BPS).bps", "a patch dropped with its game goes with it")
         c.clearAll()
 
+        // MARK: GameCube and Wii
+        section("GameCube and Wii (RVZ)")
+        check(Converter.isNintendoDisc(F.appendingPathComponent("gc/GC Game (USA).iso"))
+              && Converter.isNintendoDisc(F.appendingPathComponent("gc/wii-header.iso"))
+              && !Converter.isNintendoDisc(F.appendingPathComponent("ps2.iso")) && !Converter.isNintendoDisc(F.appendingPathComponent("plain.iso")),
+              "GameCube and Wii discs are recognised by their header (other ISOs aren't)")
+        check(Converter.nintendoSystem(F.appendingPathComponent("gc/wii-header.iso")) == "Wii", "…and told apart")
+        check(Converter.findTool("dolphin-tool") != nil, "dolphin-tool found")
+        c.verify = true
+        let gcw = workspace("gc", from: F, ["gc/GC Game (USA).iso"], into: W)
+        jobs = await runBatch([gcw.appendingPathComponent("GC Game (USA).iso")])
+        let rvz = gcw.appendingPathComponent("GC Game (USA).rvz")
+        check(jobs.first?.state == .done && exists(rvz) && !exists(gcw.appendingPathComponent("GC Game (USA).chd")),
+              "a GameCube ISO becomes an RVZ (not a CHD), verified", jobs.first?.detail ?? "")
+        c.verify = false
+        try? fm.moveItem(at: gcw.appendingPathComponent("GC Game (USA).iso"), to: gcw.appendingPathComponent("original.iso"))
+        jobs = await runBatch([rvz])
+        check(sha1(gcw.appendingPathComponent("GC Game (USA).iso")) == sha1(F.appendingPathComponent("gc/GC Game (USA).iso")),
+              "an RVZ extracts back to the identical ISO", jobs.first?.detail ?? "")
+        // Clean Up counts an RVZ as the converted copy
+        try? fm.removeItem(at: gcw.appendingPathComponent("GC Game (USA).iso"))
+        try? fm.moveItem(at: gcw.appendingPathComponent("original.iso"), to: gcw.appendingPathComponent("GC Game (USA).iso"))
+        check(Cleanup.findConverted(in: gcw, outputDir: nil, sevenZip: nil).first?.chds.first?.lastPathComponent == "GC Game (USA).rvz",
+              "Clean Up Originals counts the RVZ as converted")
+        // Patched
+        let gcp = workspace("gc-patch", from: F, ["gc/GC Game (USA).iso", "gc/gcgameenglish.xdelta"], into: W)
+        c.clearAll(); c.add([gcp.appendingPathComponent("GC Game (USA).iso")])
+        if let id = c.jobs.first?.id { c.setPatch(gcp.appendingPathComponent("gcgameenglish.xdelta"), for: id) }
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        let prvz = gcp.appendingPathComponent("GC Game (English).rvz")
+        check(exists(prvz), "a patched GameCube game becomes “GC Game (English).rvz”", c.jobs.first?.detail ?? "")
+        jobs = await runBatch([prvz])
+        check(sha1(gcp.appendingPathComponent("GC Game (English).iso")) == sha1(F.appendingPathComponent("gc/gc-patched.iso")), "…with the patch in it")
+        c.clearAll()
+
         // MARK: Making PBPs
         section("Making PBPs (PSP / PS Vita)")
         @MainActor func pbpBins(_ pbp: URL) -> [String] {

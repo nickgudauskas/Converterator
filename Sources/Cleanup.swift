@@ -190,8 +190,11 @@ final class Cleanup: ObservableObject {
     /// Nil unless they all exist and aren't empty.
     nonisolated static func covering(base: String, isPBP: Bool, in dirs: [URL]) -> [URL]? {
         for dir in dirs {
-            let chd = dir.appendingPathComponent(base + ".chd")
-            if totalSize([chd]) > 0 { return [chd] }
+            // (A GameCube/Wii disc's is an .rvz.)
+            for ext in ["chd", "rvz"] {
+                let out = dir.appendingPathComponent(base + "." + ext)
+                if totalSize([out]) > 0 { return [out] }
+            }
         }
         guard isPBP else { return nil }
         for dir in dirs {

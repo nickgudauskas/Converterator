@@ -16,6 +16,7 @@ command -v chdman >/dev/null || { echo "chdman not found: brew install rom-tools
 ./build.sh --fetch-only >/dev/null
 XDELTA=$(ls -d "$PWD"/vendor/xdelta3-*/ | head -1); XDELTA=${XDELTA%/}
 PSX="$PWD/vendor/$([[ "$(uname -m)" == arm64 ]] && echo osx-arm64 || echo osx-x64)"
+DOLPHIN=$(ls -d "$PWD"/vendor/dolphin-tool-*/ | head -1); DOLPHIN=${DOLPHIN%/}
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/converterator-tests.XXXXXX")
 # The test program keeps its settings under its own name; remove them afterwards.
@@ -168,6 +169,23 @@ printf 'ENGLISH' | dd of="$F/ps1/patched-disc1.bin" bs=1 seek=200000 conv=notrun
 "$XDELTA/xdelta3" -e -f -s "$F/ps1/PS1 Game (Disc 1).bin" "$F/ps1/patched-disc1.bin" "$F/ps1/psgameenglish.xdelta"
 chdman createcd -i "$F/ps1/PS1 Game (Disc 1).cue" -o "$F/ps1/PS1 Game (Disc 1).chd" >/dev/null 2>&1
 
+# GameCube: a minimal disc image (the header's magic number is what marks it), a patched copy and its patch.
+# Wii: just a header, for recognising one.
+mkdir -p "$F/gc"
+/usr/bin/python3 -I - "$F/gc" <<'PY'
+import sys, struct
+d = sys.argv[1]
+data = bytearray(4 * 1024 * 1024)
+data[0:6] = b"GTEST1"; data[0x1C:0x20] = struct.pack(">I", 0xC2339F3D); data[0x20:0x30] = b"Converterator GC"
+for i in range(0x440, len(data), 4096): data[i:i + 8] = bytes((i // 4096 + k) & 0xFF for k in range(8))
+open(f"{d}/GC Game (USA).iso", "wb").write(data)
+data[0x10000:0x10007] = b"ENGLISH"
+open(f"{d}/gc-patched.iso", "wb").write(data)
+wii = bytearray(0x100); wii[0x18:0x1C] = struct.pack(">I", 0x5D1C9EA3)
+open(f"{d}/wii-header.iso", "wb").write(wii)
+PY
+"$XDELTA/xdelta3" -e -f -s "$F/gc/GC Game (USA).iso" "$F/gc/gc-patched.iso" "$F/gc/gcgameenglish.xdelta"
+
 # A Redump DAT that knows some of these
 h() { shasum -a 1 "$1" | cut -c1-40; }
 {
@@ -190,4 +208,4 @@ if ! swiftc -parse-as-library -swift-version 5 $(ls Sources/*.swift | grep -v '/
 fi
 
 echo "Running…"
-CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"
+CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX:$DOLPHIN" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"

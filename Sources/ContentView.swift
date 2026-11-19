@@ -222,8 +222,8 @@ struct ContentView: View {
     private var dropPrompt: some View {
         VStack(spacing: 10) {
             Image(systemName: "opticaldisc").font(.system(size: 48)).foregroundStyle(.secondary)
-            Text("Drop .pbp, .cue, .gdi, .iso, .zip or .7z files (or folders) here").font(.title3)
-            Text("BIN/CUE, GDI and ISO images are compressed straight to CHD. PBPs and zip or 7z archives are unpacked first, and those temporary files are cleaned up. Drop a .chd file to turn it back into BIN/CUE, GDI or ISO.")
+            Text("Drop disc images or folders here").font(.title3)
+            Text("BIN/CUE, GDI and ISO images are compressed to CHD; GameCube and Wii discs (ISO, GCM, WBFS, CISO, GCZ, WIA) to RVZ. PBPs and zip or 7z archives are unpacked first, and those temporary files are cleaned up. Drop a .chd or .rvz to turn it back into BIN/CUE, GDI or ISO.")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
             Button("Add Files…", action: pickFiles).padding(.top, 4)
         }
@@ -240,7 +240,7 @@ struct ContentView: View {
                         if let patch = job.patch, let name = job.patchedName {
                             let first = job.patchMember.map { "\(patch.lastPathComponent) → \(($0 as NSString).lastPathComponent)" } ?? patch.lastPathComponent
                             let what = ([first] + job.morePatches.map(\.lastPathComponent)).joined(separator: ", then ")
-                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : job.morePatches.isEmpty ? "Patch" : "Patches"): \(what) → \(name).\(c.outputFormat == .pbp ? "pbp" : "chd")",
+                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : job.morePatches.isEmpty ? "Patch" : "Patches"): \(what) → \(name).\(c.outputFormat == .pbp ? "pbp" : Converter.isNintendoDisc(job.url) ? "rvz" : "chd")",
                                   systemImage: "bandage")
                                 .font(.caption).foregroundStyle(Color.accentColor)
                                 .lineLimit(1).truncationMode(.middle)
@@ -433,7 +433,7 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
-        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd", "zip", "7z", "xdelta", "vcdiff", "ppf", "bps", "ips"].compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd", "zip", "7z", "gcm", "wbfs", "ciso", "gcz", "wia", "rvz", "xdelta", "vcdiff", "ppf", "bps", "ips"].compactMap { UTType(filenameExtension: $0) } + [.folder]
         panel.message = "Choose .pbp, .cue, .gdi, .iso, .zip or .7z files or folders to compress, or .chd files to extract"
         present(panel) { c.add(panel.urls) }
     }

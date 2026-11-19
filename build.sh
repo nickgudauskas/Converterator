@@ -11,6 +11,9 @@ PSX_VERSION="v1.8.0"
 # chdman, built from MAME's source by .github/workflows/chdman.yml and published as a release of this repo.
 CHDMAN_VERSION="0.289"
 CHDMAN_SHA256="7a46959ffe42669e844348449b00e4fd09c268750e3f64939d0af951acf82cf7"
+# dolphin-tool, for GameCube and Wii discs (RVZ), built from Dolphin's source by .github/workflows/dolphin-tool.yml.
+DOLPHIN_VERSION="2609b"
+DOLPHIN_SHA256="04336ad3421256f1019ff1831d3274460782f22c20b828daa5b904455aa26ef0"
 # xdelta3, for applying xdelta patches: the project's own dependency-free macOS builds (Apache 2.0).
 XDELTA_VERSION="3.2.2"
 XDELTA_SHA256_ARM64="27dcf763beb075ed28061ef136613f4bc6ea3999cb424f23a7d59f18ca2d7c8b"
@@ -71,6 +74,18 @@ if [[ ! -x "$XD/xdelta3" ]]; then
   rm -rf "$XD/download"
 fi
 
+# dolphin-tool: download the universal build once into vendor/, and check it's exactly the one published.
+DT="vendor/dolphin-tool-$DOLPHIN_VERSION"
+if [[ ! -x "$DT/dolphin-tool" ]]; then
+  echo "Downloading dolphin-tool $DOLPHIN_VERSION…"
+  mkdir -p vendor
+  curl -fsSL -o "$DT.zip" "https://github.com/nickgudauskas/Converterator/releases/download/dolphin-tool-$DOLPHIN_VERSION/dolphin-tool-universal.zip"
+  if [[ "$(shasum -a 256 "$DT.zip" | cut -d' ' -f1)" != "$DOLPHIN_SHA256" ]]; then
+    echo "dolphin-tool download doesn't match the expected SHA-256"; rm -f "$DT.zip"; exit 1
+  fi
+  rm -rf "$DT"; ditto -x -k "$DT.zip" "$DT"; rm -f "$DT.zip"
+fi
+
 [[ "${1:-}" == "--fetch-only" ]] && { echo "Tools are in vendor/."; exit 0; }
 
 rm -rf "$APP" build
@@ -94,6 +109,7 @@ cp LICENSE "$APP/Contents/Resources/LICENSE"
 # chdman with MAME's licenses and a note on exactly which source it was built from
 ditto "vendor/chdman-$CHDMAN_VERSION" "$APP/Contents/Resources/chdman"
 ditto "$XD" "$APP/Contents/Resources/xdelta3"
+ditto "$DT" "$APP/Contents/Resources/dolphin-tool"
 
 # App icon: compile the Icon Composer icon (light + dark variants, made by make_icon.swift).
 # actool writes Assets.car (used by macOS for appearance-aware icons) and AppIcon.icns (fallback).
@@ -126,7 +142,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>
-      <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string></array>
+      <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string><string>gcm</string><string>wbfs</string><string>ciso</string><string>gcz</string><string>wia</string><string>rvz</string></array>
     </dict>
   </array>
   <key>NSAppTransportSecurity</key>
@@ -159,7 +175,7 @@ if [[ -n "${SIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --options runtime \
       --entitlements psxpackager.entitlements --sign "$SIGN_IDENTITY" "$bin"
   done
-  for tool in chdman xdelta3; do
+  for tool in chdman xdelta3 dolphin-tool; do
     codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP/Contents/Resources/$tool/$tool"
   done
   codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP"

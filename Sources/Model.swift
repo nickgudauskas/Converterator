@@ -89,7 +89,8 @@ struct Job: Identifiable {
     }
 
     /// A .chd input is extracted back to BIN/CUE (or GDI/ISO) instead of being compressed.
-    var isCHD: Bool { url.pathExtension.lowercased() == "chd" }
+    /// A finished image (.chd, or .rvz for GameCube/Wii): extracted, or patched into a new one.
+    var isCHD: Bool { ["chd", "rvz"].contains(url.pathExtension.lowercased()) }
     /// A .chd is extracted back to BIN/CUE, GDI or ISO, unless it has a patch: then it's unpacked,
     /// patched and compressed into a new, patched CHD.
     var isExtraction: Bool { isCHD && patch == nil }
