@@ -15,6 +15,7 @@ command -v chdman >/dev/null || { echo "chdman not found: brew install rom-tools
 # The bundled tools (xdelta3 for patch tests), downloaded by build.sh into vendor/
 ./build.sh --fetch-only >/dev/null
 XDELTA=$(ls -d "$PWD"/vendor/xdelta3-*/ | head -1); XDELTA=${XDELTA%/}
+PSX="$PWD/vendor/$([[ "$(uname -m)" == arm64 ]] && echo osx-arm64 || echo osx-x64)"
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/converterator-tests.XXXXXX")
 # The test program keeps its settings under its own name; remove them afterwards.
@@ -159,6 +160,14 @@ import os
 ips(os.path.join(os.path.dirname(d), "two", "Two (Track 1).bin"), f"{d}/two-track1-target.bin", f"{d}/track1fix.ips")
 PY
 
+# PlayStation discs for making PBPs: a two-disc game, disc 1 also patched, and a CHD of disc 1
+mkdir -p "$F/ps1"
+for d in 1 2; do /usr/bin/python3 -I tests/make_ps1_disc.py "$F/ps1/PS1 Game (Disc $d).bin" "$F/ps1/PS1 Game (Disc $d).cue" "SLUS_012.3$d" $d; done
+cp "$F/ps1/PS1 Game (Disc 1).bin" "$F/ps1/patched-disc1.bin"
+printf 'ENGLISH' | dd of="$F/ps1/patched-disc1.bin" bs=1 seek=200000 conv=notrunc 2>/dev/null
+"$XDELTA/xdelta3" -e -f -s "$F/ps1/PS1 Game (Disc 1).bin" "$F/ps1/patched-disc1.bin" "$F/ps1/psgameenglish.xdelta"
+chdman createcd -i "$F/ps1/PS1 Game (Disc 1).cue" -o "$F/ps1/PS1 Game (Disc 1).chd" >/dev/null 2>&1
+
 # A Redump DAT that knows some of these
 h() { shasum -a 1 "$1" | cut -c1-40; }
 {
@@ -181,4 +190,4 @@ if ! swiftc -parse-as-library -swift-version 5 $(ls Sources/*.swift | grep -v '/
 fi
 
 echo "Running…"
-CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"
+CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"

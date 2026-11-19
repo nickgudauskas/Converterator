@@ -145,6 +145,53 @@ struct LibraryReport: Sendable {
     }
 }
 
+// MARK: Export
+
+extension LibraryReport {
+    /// One row per item: Section, Name, Folder, Details, Size (bytes). Opens in Numbers or Excel.
+    nonisolated func csv() -> String {
+        var rows = [["Section", "Name", "Folder", "Details", "Size (bytes)"]]
+        func add(_ section: String, _ url: URL, name: String? = nil, _ details: String = "", size: Double? = nil) {
+            rows.append([section, name ?? url.lastPathComponent, url.deletingLastPathComponent().path, details, size.map { String(Int64($0)) } ?? ""])
+        }
+        rows.append(["Summary", "CHDs", "", "\(chds.count)", String(Int64(chdBytes))])
+        for u in unconverted { add("Not converted yet", u, size: totalSize(Converter.sourceFiles(for: u))) }
+        for i in leftovers { add("Originals with CHDs", i.source, "has " + i.chds.map(\.lastPathComponent).joined(separator: ", "), size: i.bytes) }
+        for m in missingDiscs {
+            rows.append(["Missing discs", m.name, m.dir.path,
+                         "has \(m.have.map(String.init).joined(separator: ", ")); missing \(m.missing.map(String.init).joined(separator: ", "))", ""])
+        }
+        for p in needsPlaylist { rows.append(["Needs a playlist", p.name + ".m3u", p.dir.path, "\(p.discs.count) discs", ""]) }
+        for o in patchOffers { add("Patches available", o.game, name: o.name + ".chd", "from \(o.game.lastPathComponent) with \(o.patch.member ?? o.patch.name)") }
+        for u in redumpNotMatching { add("Don't match Redump", u, size: totalSize([u])) }
+        for u in redumpUnchecked { add("Not checked against Redump", u, size: totalSize([u])) }
+        func cell(_ s: String) -> String { s.contains(where: { ",\"\n".contains($0) }) ? "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" : s }
+        return rows.map { $0.map(cell).joined(separator: ",") }.joined(separator: "\n") + "\n"
+    }
+
+    /// The report as plain text, section by section.
+    nonisolated func text(folder: URL?) -> String {
+        var out = "Converterator Library Report\n"
+        if let folder { out += folder.path + "\n" }
+        out += Date().formatted(date: .long, time: .shortened) + "\n\n"
+        out += "CHDs: \(chds.count) (\(formatBytes(chdBytes)))\n"
+        func section(_ title: String, _ lines: [String]) {
+            out += "\n\(title): \(lines.count)\n"
+            for l in lines { out += "  \(l)\n" }
+        }
+        section("Not converted yet", unconverted.map { "\($0.lastPathComponent)  (\($0.deletingLastPathComponent().lastPathComponent))" })
+        section("Originals that already have CHDs", leftovers.map { "\($0.source.lastPathComponent)  (\(formatBytes($0.bytes)))" })
+        section("Multi-disc games with a disc missing", missingDiscs.map {
+            "\($0.name): has disc \($0.have.map(String.init).joined(separator: ", ")); missing \($0.missing.map(String.init).joined(separator: ", "))"
+        })
+        section("Multi-disc games without a playlist", needsPlaylist.map { "\($0.name) (\($0.discs.count) discs)" })
+        if patchesFolderOn { section("Patches available", patchOffers.map { "\($0.name).chd  from \($0.game.lastPathComponent)" }) }
+        section("Don't match Redump", redumpNotMatching.map(\.lastPathComponent))
+        out += "\nMatch Redump: \(redumpMatched)   Not checked yet: \(redumpUnchecked.count)\n"
+        return out
+    }
+}
+
 @MainActor
 final class Library: ObservableObject {
     static let shared = Library()
@@ -198,6 +245,13 @@ struct LibraryView: View {
                     .lineLimit(1).truncationMode(.head)
                     .foregroundStyle(m.folder == nil ? .secondary : .primary)
                 Spacer()
+                if let r = m.report, !m.isScanning {
+                    Menu("Export") {
+                        Button("As a Spreadsheet (CSV)…") { export(r, csv: true) }
+                        Button("As Text…") { export(r, csv: false) }
+                    }
+                    .fixedSize()
+                }
                 if m.folder != nil { Button("Rescan") { m.rescan() }.disabled(m.isScanning) }
                 Button("Choose Folder…", action: chooseFolder).disabled(m.isScanning)
             }
@@ -344,6 +398,20 @@ struct LibraryView: View {
 
     @ViewBuilder private func more(_ count: Int) -> some View {
         if count > 200 { Text("…and \(count - 200) more").font(.caption).foregroundStyle(.secondary) }
+    }
+
+    /// Saves the report as CSV (for Numbers or Excel) or plain text.
+    private func export(_ r: LibraryReport, csv: Bool) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [csv ? .commaSeparatedText : .plainText]
+        panel.nameFieldStringValue = "Library Report – \(m.folder?.lastPathComponent ?? "Games").\(csv ? "csv" : "txt")"
+        panel.canCreateDirectories = true
+        let done: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try (csv ? r.csv() : r.text(folder: m.folder)).write(to: url, atomically: true, encoding: .utf8); m.message = "Saved \(url.lastPathComponent)." }
+            catch { m.message = "Couldn't save the report: \(error.localizedDescription)" }
+        }
+        if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
     }
 
     private func chooseFolder() {

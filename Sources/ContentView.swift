@@ -240,7 +240,7 @@ struct ContentView: View {
                         if let patch = job.patch, let name = job.patchedName {
                             let first = job.patchMember.map { "\(patch.lastPathComponent) → \(($0 as NSString).lastPathComponent)" } ?? patch.lastPathComponent
                             let what = ([first] + job.morePatches.map(\.lastPathComponent)).joined(separator: ", then ")
-                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : job.morePatches.isEmpty ? "Patch" : "Patches"): \(what) → \(name).chd",
+                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : job.morePatches.isEmpty ? "Patch" : "Patches"): \(what) → \(name).\(c.outputFormat == .pbp ? "pbp" : "chd")",
                                   systemImage: "bandage")
                                 .font(.caption).foregroundStyle(Color.accentColor)
                                 .lineLimit(1).truncationMode(.middle)
@@ -299,8 +299,20 @@ struct ContentView: View {
                 if c.outputDir != nil { Button("Reset") { c.outputDir = nil } }
             }
             HStack(spacing: 20) {
-                Toggle("Overwrite existing CHDs", isOn: $c.overwrite)
+                Picker("Make:", selection: $c.outputFormat) {
+                    ForEach(OutputFormat.allCases) { Text($0.label).tag($0) }
+                }
+                .fixedSize()
+                .help("PBP makes PlayStation games for a PSP or PS Vita (PlayStation games only). Discs of one game go into one PBP.")
+                if c.outputFormat == .pbp {
+                    Toggle("Put each in its own folder as EBOOT.PBP (for a PSP)", isOn: $c.pbpFolders)
+                        .help("A PSP finds PlayStation games as PSP/GAME/<folder>/EBOOT.PBP. Copy the folders to PSP/GAME on the memory stick.")
+                }
+            }
+            HStack(spacing: 20) {
+                Toggle(c.outputFormat == .pbp ? "Overwrite existing PBPs" : "Overwrite existing CHDs", isOn: $c.overwrite)
                 Toggle("Make .m3u playlist for multi-disc games", isOn: $c.makeM3U)
+                    .disabled(c.outputFormat == .pbp)
             }
             HStack(spacing: 20) {
                 Toggle("Verify CHDs after writing", isOn: $c.verify)
@@ -311,7 +323,9 @@ struct ContentView: View {
                 .fixedSize()
                 .help("Automatic makes a DVD CHD for PS2 and PSP games and anything bigger than a CD, and a CD CHD otherwise.")
             }
+            .disabled(c.outputFormat == .pbp)   // CHD settings
             Toggle("Move source files to Trash after a successful conversion", isOn: $c.trashSources)
+                .disabled(c.outputFormat == .pbp)   // making PBPs never moves the originals
                 .help("Moves the .pbp/.cue/.gdi/.iso file and any .bin tracks it lists to the Trash, only after its CHD is written. For a .chd you extract, moves the .chd. Turns off each time the app starts.")
         }
         .disabled(c.isRunning)

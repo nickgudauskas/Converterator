@@ -35,6 +35,14 @@ final class Converter: ObservableObject {
     @Published var startFromFinder: Bool {
         didSet { UserDefaults.standard.set(startFromFinder, forKey: "startFromFinder") }
     }
+    /// What to make: CHDs (the usual), or PBPs for a PSP or PS Vita (PlayStation games only).
+    @Published var outputFormat: OutputFormat {
+        didSet { UserDefaults.standard.set(outputFormat.rawValue, forKey: "outputFormat") }
+    }
+    /// For a PSP: each PBP goes in a folder named after the game, as EBOOT.PBP.
+    @Published var pbpFolders: Bool {
+        didSet { UserDefaults.standard.set(pbpFolders, forKey: "pbpFolders") }
+    }
     @Published var isoMode: ISOMode {
         didSet { UserDefaults.standard.set(isoMode.rawValue, forKey: "isoMode") }
     }
@@ -60,7 +68,7 @@ final class Converter: ObservableObject {
     /// Deliberately not remembered between launches, so it's never on by surprise.
     @Published var trashSources = false
 
-    private var cancelRequested = false
+    private(set) var cancelRequested = false
     private var pauseRequested = false
     private var pauseNow = false
     private var pausedAt: Date?
@@ -75,6 +83,8 @@ final class Converter: ObservableObject {
         verify = d.bool(forKey: "verify")
         isoMode = ISOMode(rawValue: d.string(forKey: "isoMode") ?? "") ?? .automatic
         startFromFinder = d.object(forKey: "startFromFinder") as? Bool ?? true
+        outputFormat = OutputFormat(rawValue: d.string(forKey: "outputFormat") ?? "") ?? .chd
+        pbpFolders = d.bool(forKey: "pbpFolders")
         restoreQueue()
     }
 
@@ -154,8 +164,8 @@ final class Converter: ObservableObject {
                 let e = fm.enumerator(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
                 while let f = e?.nextObject() as? URL {
                     let ext = f.pathExtension.lowercased()
-                    if Converter.inputExtensions.contains(ext) {
-                        found.append(f)
+                    if Converter.inputExtensions.contains(ext) || (ext == "chd" && outputFormat == .pbp) {
+                        found.append(f)   // (CHDs too when making PBPs: they're the games then)
                     } else if Converter.archiveExtensions.contains(ext), archiveHasDiscImage(f) {
                         found.append(f)   // only archives with a disc image inside, not zipped cartridge games
                     }
@@ -440,7 +450,8 @@ final class Converter: ObservableObject {
             var last: UUID?
             while !cancelRequested && !pauseRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
                 last = jobs[i].id
-                if jobs[i].isExtraction { await extract(index: i) } else { await convert(index: i) }
+                if outputFormat == .pbp { await makePBP(index: i) }
+                else if jobs[i].isExtraction { await extract(index: i) } else { await convert(index: i) }
             }
             isRunning = false
             if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
@@ -476,7 +487,7 @@ final class Converter: ObservableObject {
         }
     }
 
-    private func update(_ id: UUID, _ change: (inout Job) -> Void) {
+    func update(_ id: UUID, _ change: (inout Job) -> Void) {
         if let i = jobs.firstIndex(where: { $0.id == id }) { change(&jobs[i]) }
     }
 
@@ -848,7 +859,7 @@ final class Converter: ObservableObject {
     var sevenZip: URL? { Converter.findTool("7zz") ?? Converter.findTool("7z") }
 
     /// Unpacks a .zip (with macOS's own ditto) or .7z (with 7-Zip). Returns an error message, or nil.
-    private func unpackArchive(_ src: URL, to dir: URL) async -> String? {
+    func unpackArchive(_ src: URL, to dir: URL) async -> String? {
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         catch { return "Can't create temporary folder: \(error.localizedDescription)" }
         let exe: URL, args: [String]
@@ -1286,7 +1297,7 @@ final class Converter: ObservableObject {
     }
 
     /// Runs a command-line tool, streaming its output line by line to `onLine` on the main thread.
-    private func run(_ exe: URL, _ args: [String], onLine: @escaping (String) -> Void) async -> Int32 {
+    func run(_ exe: URL, _ args: [String], onLine: @escaping (String) -> Void) async -> Int32 {
         let p = Process()
         p.executableURL = exe
         p.arguments = args

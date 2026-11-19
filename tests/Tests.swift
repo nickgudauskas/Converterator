@@ -221,6 +221,12 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         check(gaps["Game D (USA)"] == [3], "missing disc from Redump's disc count", "\(gaps)")
         check(Set(r.needsPlaylist.map(\.name)) == ["Game A", "Game B", "Game D (USA)"], "sets without playlists", "\(r.needsPlaylist.map(\.name))")
         check(r.redumpMatched == 1 && r.redumpUnchecked.count == 6, "Redump counts from remembered results", "\(r.redumpMatched) / \(r.redumpUnchecked.count)")
+        // Export
+        let csv = r.csv()
+        check(csv.hasPrefix("Section,Name,Folder,Details,Size (bytes)\n") && csv.contains("Not converted yet,New.iso,")
+              && csv.contains("Missing discs,Game B,") && csv.contains("\"has 1, 3; missing 2\""), "report exports as CSV (with quoting)")
+        let txt = r.text(folder: lib)
+        check(txt.contains("Not converted yet: 1") && txt.contains("Game B: has disc 1, 3; missing 2"), "report exports as text")
         // Ambiguous: two originals pointing at one CHD in a shared folder are left out of cleanup
         let shared = W.appendingPathComponent("shared"); let a1 = W.appendingPathComponent("amb1"), a2 = W.appendingPathComponent("amb2")
         for d in [shared, a1, a2] { try? fm.createDirectory(at: d, withIntermediateDirectories: true) }
@@ -447,6 +453,60 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         let dz = workspace("patch-drop", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (BPS).bps"], into: W)
         c.clearAll(); c.add([dz.appendingPathComponent("Base.cue"), dz.appendingPathComponent("Base (BPS).bps")])
         check(c.jobs.count == 1 && c.jobs.first?.patch?.lastPathComponent == "Base (BPS).bps", "a patch dropped with its game goes with it")
+        c.clearAll()
+
+        // MARK: Making PBPs
+        section("Making PBPs (PSP / PS Vita)")
+        @MainActor func pbpBins(_ pbp: URL) -> [String] {
+            let out = W.appendingPathComponent("pbp-out-\(UUID().uuidString)")
+            try? fm.createDirectory(at: out, withIntermediateDirectories: true)
+            let p = Process(); p.executableURL = c.psxpackager
+            p.arguments = ["-i", pbp.path, "-o", out.path, "-x", "-v", "1"]
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try? p.run(); p.waitUntilExit()
+            return ((try? fm.contentsOfDirectory(at: out, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension.lowercased() == "bin" }
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+                .compactMap(sha1)
+        }
+        check(c.psxpackager != nil, "PSXPackager found")
+        c.outputFormat = .pbp
+        let d1 = sha1(F.appendingPathComponent("ps1/PS1 Game (Disc 1).bin")), d2 = sha1(F.appendingPathComponent("ps1/PS1 Game (Disc 2).bin"))
+        // One disc
+        let pb1 = workspace("pbp-single", from: F, ["ps1/PS1 Game (Disc 1).cue", "ps1/PS1 Game (Disc 1).bin"], into: W)
+        jobs = await runBatch([pb1])
+        check(pbpBins(pb1.appendingPathComponent("PS1 Game (Disc 1).pbp")) == [d1].compactMap { $0 }, "a disc becomes a PBP with the same data",
+              jobs.first?.detail ?? "")
+        // Two discs, one PBP
+        let pb2 = workspace("pbp-multi", from: F, ["ps1/PS1 Game (Disc 1).cue", "ps1/PS1 Game (Disc 1).bin",
+                                                   "ps1/PS1 Game (Disc 2).cue", "ps1/PS1 Game (Disc 2).bin"], into: W)
+        jobs = await runBatch([pb2])
+        check(pbpBins(pb2.appendingPathComponent("PS1 Game.pbp")) == [d1, d2].compactMap { $0 }, "two discs of a game go into one PBP",
+              jobs.map(\.detail).joined(separator: " | "))
+        check(jobs.allSatisfy { $0.state == .done } && jobs.contains { $0.detail.contains("with the other discs") }, "…and both are marked done")
+        // Patched
+        let pb3 = workspace("pbp-patched", from: F, ["ps1/PS1 Game (Disc 1).cue", "ps1/PS1 Game (Disc 1).bin", "ps1/psgameenglish.xdelta"], into: W)
+        c.clearAll(); c.add([pb3.appendingPathComponent("PS1 Game (Disc 1).cue")])
+        if let id = c.jobs.first?.id { c.setPatch(pb3.appendingPathComponent("psgameenglish.xdelta"), for: id) }
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(pbpBins(pb3.appendingPathComponent("PS1 Game (English).pbp")) == [sha1(F.appendingPathComponent("ps1/patched-disc1.bin"))].compactMap { $0 },
+              "a patched game becomes a patched PBP, named “PS1 Game (English)”", c.jobs.first?.detail ?? "")
+        check(sha1(pb3.appendingPathComponent("PS1 Game (Disc 1).bin")) == d1, "…and the original is untouched")
+        // From a CHD, into a PSP folder
+        c.pbpFolders = true
+        let pb4 = workspace("pbp-chd", from: F, ["ps1/PS1 Game (Disc 1).chd"], into: W)
+        c.clearAll(); c.add([pb4])   // a folder scan picks up CHDs when making PBPs
+        check(c.jobs.count == 1, "making PBPs, a folder scan picks up CHDs")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(pbpBins(pb4.appendingPathComponent("PS1 Game (Disc 1)/EBOOT.pbp")) == [d1].compactMap { $0 },
+              "a CHD becomes PS1 Game (Disc 1)/EBOOT.PBP for a PSP", c.jobs.first?.detail ?? "")
+        c.pbpFolders = false
+        // Not a PlayStation game
+        let pb5 = workspace("pbp-notps1", from: F, ["plain.iso"], into: W)
+        jobs = await runBatch([pb5.appendingPathComponent("plain.iso")])
+        check(jobs.first?.state == .failed && jobs.first?.detail.contains("PlayStation") == true && !exists(pb5.appendingPathComponent("plain.pbp")),
+              "a disc that isn't a PlayStation game is refused", jobs.first?.detail ?? "")
+        c.outputFormat = .chd
         c.clearAll()
 
         // MARK: Pause and the saved queue

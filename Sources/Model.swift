@@ -110,6 +110,13 @@ func totalSize(_ urls: [URL]) -> Double {
     }
 }
 
+/// What a batch makes.
+enum OutputFormat: String, CaseIterable, Identifiable {
+    case chd, pbp
+    var id: String { rawValue }
+    var label: String { self == .chd ? "CHD" : "PBP for PSP / PS Vita" }
+}
+
 /// How chdman should treat .iso files.
 enum ISOMode: String, CaseIterable, Identifiable {
     case automatic, cd, dvd
