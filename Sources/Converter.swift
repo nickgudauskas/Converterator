@@ -135,7 +135,7 @@ final class Converter: ObservableObject {
         var droppedPatches: [URL] = []
         func consider(_ f: URL) {
             let ext = f.pathExtension.lowercased()
-            if PatchFormat.of(f) != nil {
+            if PatchFormat.of(f) != nil || Patcher.isPatchZip(f) {
                 droppedPatches.append(f)
             } else if Converter.inputExtensions.contains(ext) || Converter.extractExtensions.contains(ext)
                 || Converter.archiveExtensions.contains(ext) {
@@ -185,6 +185,8 @@ final class Converter: ObservableObject {
         } else if !droppedPatches.isEmpty {
             append("To use a patch, drop it together with its game, put it next to the game with the same name, or right-click the game → Add Patch….")
         }
+        // Games still without a patch: look in the patches folder, if one is set up.
+        PatchLibrary.shared.lookUp(newJobs.filter { $0.patch == nil && !$0.isExtraction && $0.state == .queued }.map { ($0.id, $0.url) })
         // Files added mid-run join the current batch.
         if isRunning || isPaused { batchIDs += newJobs.filter { $0.state == .queued }.map(\.id) }
         if found.isEmpty && droppedPatches.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso, .chd, .zip or .7z files found in what was added.") }
@@ -194,9 +196,20 @@ final class Converter: ObservableObject {
     func setPatch(_ patch: URL?, for id: UUID) {
         guard let i = jobs.firstIndex(where: { $0.id == id }), jobs[i].state != .working, !jobs[i].isExtraction else { return }
         jobs[i].patch = patch
+        jobs[i].patchMember = nil
+        jobs[i].patchFromFolder = false
         // Patching a finished or failed file means doing it again.
         if jobs[i].state != .queued { jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil; jobs[i].fraction = 0 }
         savedSignature = ""; saveQueueIfChanged()
+    }
+
+    /// A patch the patches folder found for a waiting game that has none yet.
+    func setFolderPatch(_ patch: URL, member: String?, for id: UUID) {
+        guard let i = jobs.firstIndex(where: { $0.id == id }), jobs[i].state == .queued, jobs[i].patch == nil else { return }
+        jobs[i].patch = patch
+        jobs[i].patchMember = member
+        jobs[i].patchFromFolder = true
+        append("Found a patch for \(jobs[i].url.lastPathComponent) in your patches folder: \(member.map { "\(patch.lastPathComponent) → \($0)" } ?? patch.lastPathComponent)")
     }
 
     func clearFinished() { jobs.removeAll { $0.state == .done || $0.state == .failed } }
@@ -223,6 +236,8 @@ final class Converter: ObservableObject {
         let bytesOut: Double
         let outputs: [String]
         var patch: String? = nil
+        var patchMember: String? = nil
+        var patchFromFolder: Bool? = nil
     }
 
     nonisolated static var queueFile: URL { AppPaths.dataDir.appendingPathComponent("queue.json") }
@@ -235,7 +250,8 @@ final class Converter: ObservableObject {
         savedSignature = signature
         let saved = jobs.map { j in
             SavedJob(path: j.url.path, state: "\(j.state)", detail: j.detail, weight: j.weight,
-                     bytesIn: j.bytesIn, bytesOut: j.bytesOut, outputs: j.outputs.map(\.path), patch: j.patch?.path)
+                     bytesIn: j.bytesIn, bytesOut: j.bytesOut, outputs: j.outputs.map(\.path), patch: j.patch?.path,
+                     patchMember: j.patchMember, patchFromFolder: j.patchFromFolder)
         }
         try? FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
         try? JSONEncoder().encode(saved).write(to: Converter.queueFile, options: .atomic)
@@ -255,6 +271,8 @@ final class Converter: ObservableObject {
             j.weight = s.weight; j.bytesIn = s.bytesIn; j.bytesOut = s.bytesOut
             j.outputs = s.outputs.map { URL(fileURLWithPath: $0) }
             j.patch = s.patch.map { URL(fileURLWithPath: $0) }
+            j.patchMember = s.patchMember
+            j.patchFromFolder = s.patchFromFolder ?? false
             j.timed = j.state == .queued
             return j
         }
@@ -452,6 +470,7 @@ final class Converter: ObservableObject {
         var skipped = 0                 // CHDs that already existed and weren't rewritten
         var bytesIn = 0.0, bytesOut = 0.0
         var redump: [RedumpResult] = []  // one per game checked against Redump
+        var patchedWith: String?         // the patch file applied, if any
     }
 
     private func convert(index: Int) async {
@@ -478,7 +497,7 @@ final class Converter: ObservableObject {
         // already there and won't be rewritten.
         let patch = job.patch
         if let patch, !fm.fileExists(atPath: patch.path) { return fail("Can't find the patch \(patch.lastPathComponent)") }
-        let outName = patch.map { Patcher.patchedName(game: src, patch: $0) }
+        let outName = job.patchedName
             ?? src.deletingPathExtension().lastPathComponent
         let alreadyThere = !overwrite && Converter.inputExtensions.contains(src.pathExtension.lowercased())
             && src.pathExtension.lowercased() != "pbp"
@@ -512,11 +531,13 @@ final class Converter: ObservableObject {
             let w = (span.end - span.start) / Double(games.count)
             let start = span.start + w * Double(i)
             guard let r = await compressGame(game, id: id, outDir: outDir, span: (start, start + w), patch: patch,
+                                             patchMember: job.patchMember, patchFromFolder: job.patchFromFolder,
                                              fail: { fail(games.count > 1 ? "\(game.lastPathComponent): \($0)" : $0) })
             else { return }
             total.made += r.made; total.skipped += r.skipped
             total.bytesIn += r.bytesIn; total.bytesOut += r.bytesOut
             total.redump += r.redump
+            total.patchedWith = total.patchedWith ?? r.patchedWith
         }
         // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
         if isArchive && total.bytesOut > 0 { total.bytesIn = totalSize([src]) }
@@ -528,7 +549,8 @@ final class Converter: ObservableObject {
         } else {
             summary += " · " + Converter.describeSaving(input: total.bytesIn, output: total.bytesOut)
         }
-        if let patch { summary += " · patched with \(patch.lastPathComponent)" }
+        if let used = total.patchedWith { summary += " · patched with \(used)" }
+        else if patch != nil { summary += " · the patch didn't fit, so it's unpatched" }
         if verify { summary += " · verified" }
         let unmatched = total.redump.first { !$0.isMatch }
         if !total.redump.isEmpty { summary += " · " + (unmatched?.short ?? "✓ Redump") }
@@ -536,7 +558,7 @@ final class Converter: ObservableObject {
         // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
         if trashSources {
             let outputsOK = made.allSatisfy { totalSize([$0]) > 0 }
-            if patch != nil {
+            if total.patchedWith != nil || patch != nil {
                 append("  Kept source files: a patched game always keeps its originals.")
             } else if total.skipped > 0 {
                 append("  Kept source files: a CHD already existed and wasn't rewritten.")
@@ -574,6 +596,7 @@ final class Converter: ObservableObject {
     /// Compresses one game (.pbp, .cue, .gdi or .iso) to one CHD per disc, plus an .m3u for
     /// multi-disc games. Progress goes into `span` of the job's 0…1. Returns nil after calling `fail`.
     private func compressGame(_ src: URL, id: UUID, outDir: URL, span: (Double, Double), patch: URL? = nil,
+                              patchMember: String? = nil, patchFromFolder: Bool = false,
                               fail: (String) -> Void) async -> GameResult? {
         let fm = FileManager.default
         let base = src.deletingPathExtension().lastPathComponent
@@ -604,13 +627,9 @@ final class Converter: ObservableObject {
             redump = r
         }
         // Optional: name the CHD after the Redump game it matches, e.g. "Armored Core (USA).chd".
-        // A patched game is named for what it is, e.g. "Racing Lagoon (English)" (see Patcher.patchedName).
+        // (A patched game is named for what it is once the patch is applied, below.)
         var chdBase = base
-        if let patch {
-            var redumpGame: String?
-            if case .match(let g) = redump { redumpGame = g }
-            chdBase = Patcher.patchedName(game: src, patch: patch, redumpGame: redumpGame)
-        } else if case .match(let game) = redump, RedumpDB.shared.renameToRedump {
+        if patch == nil, case .match(let game) = redump, RedumpDB.shared.renameToRedump {
             let named = Converter.safeFileName(game)
             if named != base { append("  naming it after Redump: \(named).chd"); chdBase = named }
         }
@@ -642,26 +661,42 @@ final class Converter: ObservableObject {
         var inputs = cues
         let patchWork = fm.temporaryDirectory.appendingPathComponent("converterator-patch-\(UUID().uuidString)", isDirectory: true)
         defer { if patch != nil { try? fm.removeItem(at: patchWork) } }
+        var applied: URL?   // the patch file used, if any
         if let patch {
             update(id) { $0.detail = "Applying \(patch.lastPathComponent)…"; $0.progress = nil }
             let xdelta = Converter.findTool("xdelta3")
-            var problem = "The patch doesn't fit this game"
-            var applied = false
-            for (n, cue) in cues.enumerated() {
-                let r = await Patcher.preparePatched(cue, patch: patch, work: patchWork.appendingPathComponent("disc\(n + 1)"),
-                                                     xdelta: xdelta) { _ in }
-                switch r {
-                case .success(let p):
-                    inputs[n] = p.disc
-                    applied = true
-                    append("  applied \(patch.lastPathComponent) (\(PatchFormat.of(patch)?.rawValue ?? "patch")) to \(p.track.lastPathComponent)")
-                case .failure(let f):
-                    problem = f.message
+            // A zip may hold several patches (versions, regions): try each until one fits.
+            let candidates = Patcher.patchFiles(patch, member: patchMember, unpackInto: patchWork.appendingPathComponent("patches"))
+            var problem = candidates.isEmpty ? "There's no IPS, BPS, PPF or xdelta patch in \(patch.lastPathComponent)" : "The patch doesn't fit this game"
+            tryPatches: for (k, candidate) in candidates.enumerated() {
+                for (n, cue) in cues.enumerated() {
+                    let r = await Patcher.preparePatched(cue, patch: candidate, work: patchWork.appendingPathComponent("disc\(n + 1)-\(k)"),
+                                                         xdelta: xdelta) { _ in }
+                    switch r {
+                    case .success(let p):
+                        inputs[n] = p.disc
+                        applied = candidate
+                        let from = candidate == patch ? "" : " from \(patch.lastPathComponent)"
+                        append("  applied \(candidate.lastPathComponent)\(from) (\(PatchFormat.of(candidate)?.rawValue ?? "patch")) to \(p.track.lastPathComponent)")
+                        break tryPatches
+                    case .failure(let f):
+                        problem = f.message
+                    }
                 }
-                if applied { break }
             }
             if cancelRequested { fail("Cancelled"); return nil }
-            guard applied else { fail(problem); return nil }
+            if applied == nil {
+                // A patch the folder matched by name may not be for this version: convert without it.
+                guard patchFromFolder else { fail(problem); return nil }
+                append("  \(patch.lastPathComponent) from your patches folder doesn't fit this game (\(problem)); converting it without the patch.")
+            }
+        }
+        // A patched game is named for what it is, e.g. "Racing Lagoon (English)" (see Patcher.patchedName).
+        if let applied {
+            var redumpGame: String?
+            if case .match(let g) = redump { redumpGame = g }
+            chdBase = Patcher.patchedName(game: src, patch: applied, redumpGame: redumpGame,
+                                          alsoLookIn: patch?.deletingPathExtension().lastPathComponent)
         }
 
         let discCount = Double(cues.count)
@@ -676,7 +711,7 @@ final class Converter: ObservableObject {
         for (n, original) in cues.enumerated() {
             let cue = inputs[n]   // the patched copy, if this disc was patched
             let name = cues.count == 1 ? chdBase
-                : patch != nil ? "\(chdBase) (Disc \(n + 1))" : original.deletingPathExtension().lastPathComponent
+                : applied != nil ? "\(chdBase) (Disc \(n + 1))" : original.deletingPathExtension().lastPathComponent
             let out = outDir.appendingPathComponent(name + ".chd")
             let disc = cues.count == 1 ? "" : " disc \(n + 1) of \(cues.count)"
             var wroteThisDisc = false
@@ -718,7 +753,7 @@ final class Converter: ObservableObject {
                 wroteThisDisc = true
                 // The CHD holds exactly what was checked, so remember its Redump result for later.
                 // (Not for a patched game: its CHD differs from the dump that was checked.)
-                if let redump, cues.count == 1, patch == nil { RedumpCache.store(out, redump) }
+                if let redump, cues.count == 1, applied == nil { RedumpCache.store(out, redump) }
             }
 
             // Optional: check the CHD's checksums, including CHDs that already existed.
@@ -739,10 +774,11 @@ final class Converter: ObservableObject {
         }
 
         if let redump { result.redump = [redump] }
+        result.patchedWith = applied?.lastPathComponent
 
-        // Multi-disc playlist
+        // Multi-disc playlist (named like the CHDs: a patched set gets the patched name)
         if result.made.count > 1 && makeM3U {
-            let m3u = outDir.appendingPathComponent(base + ".m3u")
+            let m3u = outDir.appendingPathComponent((applied != nil ? chdBase : base) + ".m3u")
             let body = result.made.map { $0.lastPathComponent }.joined(separator: "\n") + "\n"
             do { try body.write(to: m3u, atomically: true, encoding: .utf8); append("  wrote \(m3u.lastPathComponent)") }
             catch { append("  couldn't write \(m3u.lastPathComponent): \(error.localizedDescription)") }

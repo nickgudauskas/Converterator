@@ -237,8 +237,9 @@ struct ContentView: View {
                     icon(for: job).frame(width: 20)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(job.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
-                        if let patch = job.patch {
-                            Label("Patch: \(patch.lastPathComponent) → \(Patcher.patchedName(game: job.url, patch: patch)).chd",
+                        if let patch = job.patch, let name = job.patchedName {
+                            let what = job.patchMember.map { "\(patch.lastPathComponent) → \(($0 as NSString).lastPathComponent)" } ?? patch.lastPathComponent
+                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : "Patch"): \(what) → \(name).chd",
                                   systemImage: "bandage")
                                 .font(.caption).foregroundStyle(Color.accentColor)
                                 .lineLimit(1).truncationMode(.middle)
@@ -404,9 +405,9 @@ struct ContentView: View {
     private func pickPatch(for job: Job) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = PatchFormat.byExtension.keys.compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = (Array(PatchFormat.byExtension.keys) + ["zip"]).compactMap { UTType(filenameExtension: $0) }
         panel.directoryURL = job.url.deletingLastPathComponent()
-        panel.message = "Choose a patch for \(job.url.lastPathComponent) (IPS, BPS, PPF or xdelta). The CHD will be named after the patch."
+        panel.message = "Choose a patch for \(job.url.lastPathComponent) (IPS, BPS, PPF or xdelta, or the .zip it came in)."
         present(panel) { if let url = panel.url { c.setPatch(url, for: job.id) } }
     }
 

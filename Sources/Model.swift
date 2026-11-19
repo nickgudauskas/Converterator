@@ -76,6 +76,17 @@ struct Job: Identifiable {
     var outputs: [URL] = []
     /// A patch (translation, fix) applied before compressing; the CHD is named after it.
     var patch: URL?
+    /// For a patch zip: which file inside it (when the patches folder matched one), else nil = try each.
+    var patchMember: String?
+    /// Found in the patches folder rather than chosen: if it doesn't fit, the game is converted without it.
+    var patchFromFolder = false
+
+    /// "Racing Lagoon (English)": what the CHD will be called if the patch is used (before Redump's name is known).
+    var patchedName: String? {
+        guard let patch else { return nil }
+        let inner = patchMember.map { URL(fileURLWithPath: $0) } ?? patch
+        return Patcher.patchedName(game: url, patch: inner, alsoLookIn: patch.deletingPathExtension().lastPathComponent)
+    }
 
     /// A .chd input is extracted back to BIN/CUE (or GDI/ISO) instead of being compressed.
     var isExtraction: Bool { url.pathExtension.lowercased() == "chd" }

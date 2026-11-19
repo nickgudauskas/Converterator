@@ -10,12 +10,27 @@ import CryptoKit
 struct SettingsView: View {
     @ObservedObject private var c = Converter.shared
     @ObservedObject private var redump = RedumpDB.shared
+    @ObservedObject private var patches = PatchLibrary.shared
 
     var body: some View {
         Form {
             Section("Finder") {
                 Toggle("Start converting right away", isOn: $c.startFromFinder)
                 Text("For files sent with Convert with Converterator in Finder's right-click menu (under Quick Actions or Services). Turned off, they're just added to the list.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Patches") {
+                HStack {
+                    Text("Patches folder:")
+                    Text(patches.folder?.path(percentEncoded: false) ?? "None")
+                        .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                    Spacer()
+                    Button("Choose…", action: choosePatchesFolder)
+                    if patches.folder != nil { Button("Clear") { patches.folder = nil } }
+                }
+                Toggle("Find patches for games automatically", isOn: $patches.enabled)
+                    .disabled(patches.folder == nil)
+                Text("Keep your patches in one folder, loose or still in their download zips. Each game you add gets the patch made for it: BPS and PPF patches are matched by checksum, xdelta and IPS patches by the game's name (preferring \(PatchLibrary.preferredLanguage ?? "your language") when there are several). If a patch matched by name doesn't fit, the game is converted without it. \(patches.folder == nil ? "" : "\(patches.patchCount) patch\(patches.patchCount == 1 ? "" : "es") in the folder.")")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Redump") {
@@ -76,6 +91,17 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 560)
         .frame(minHeight: 520)
+    }
+
+    private func choosePatchesFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose the folder where you keep your patches (subfolders and zips are included)"
+        let done: (NSApplication.ModalResponse) -> Void = { if $0 == .OK, let url = panel.url { patches.folder = url } }
+        if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { done(panel.runModal()) }
     }
 
     private func addDATs() {

@@ -23,7 +23,7 @@ enum Patcher {
     /// name. Otherwise ("racinglagoonenglish", "rl_t-en_v1") it's the game's title, from Redump's name for
     /// the original dump if it matched, else the original file's name, without its region and other tags,
     /// plus what the patch is for: a language, "Undub", or "Patched".
-    nonisolated static func patchedName(game: URL, patch: URL, redumpGame: String? = nil) -> String {
+    nonisolated static func patchedName(game: URL, patch: URL, redumpGame: String? = nil, alsoLookIn other: String? = nil) -> String {
         let patchName = patch.deletingPathExtension().lastPathComponent
         if patchName.contains(" ") && patchName.contains(where: \.isUppercase) {
             return Converter.safeFileName(patchName)
@@ -32,7 +32,9 @@ enum Patcher {
         if let r = title.range(of: #"\s*[\(\[]"#, options: .regularExpression) { title = String(title[..<r.lowerBound]) }
         title = title.trimmingCharacters(in: .whitespaces)
         if title.isEmpty { title = game.deletingPathExtension().lastPathComponent }
-        return Converter.safeFileName("\(title) (\(tag(for: patchName) ?? "Patched"))")
+        // `other`: the zip a patch came in, whose name often says the language when the patch's doesn't.
+        let what = tag(for: patchName) ?? other.flatMap { tag(for: $0) } ?? "Patched"
+        return Converter.safeFileName("\(title) (\(what))")
     }
 
     /// Languages (and undubs) as they show up in patch names. Full words are found even run together
@@ -74,6 +76,9 @@ enum Patcher {
                 if FileManager.default.fileExists(atPath: p.path) { return p }
             }
         }
+        // Or still in its download zip (a zip of patches, not the game's own archive)
+        let zip = base.appendingPathExtension("zip")
+        if zip != game, FileManager.default.fileExists(atPath: zip.path), isPatchZip(zip) { return zip }
         return nil
     }
 
@@ -345,5 +350,178 @@ enum Patcher {
             }
         }
         return c ^ 0xFFFFFFFF
+    }
+}
+
+// MARK: - Zipped patches
+
+extension Patcher {
+    /// A .zip holding patch files but no disc images, as translation patches are usually downloaded.
+    nonisolated static func isPatchZip(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "zip", let entries = Converter.zipEntryNames(url) else { return false }
+        let exts = entries.map { ($0 as NSString).pathExtension.lowercased() }
+        return exts.contains { PatchFormat.byExtension[$0] != nil } && !exts.contains { Converter.inputExtensions.contains($0) }
+    }
+
+    /// The patch files to try: the file itself, or (for a zip) every patch inside it, newest-looking
+    /// first ("v1.1" before "v1.0"). `member` limits a zip to one file inside it.
+    nonisolated static func patchFiles(_ patch: URL, member: String?, unpackInto dir: URL) -> [URL] {
+        guard patch.pathExtension.lowercased() == "zip" else { return [patch] }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard UpdateChecker.runTool("/usr/bin/ditto", ["-x", "-k", patch.path, dir.path]) == 0 else { return [] }
+        let all = (FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
+            .allObjects as? [URL] ?? [])
+            .filter { PatchFormat.of($0) != nil && !$0.path.contains("/__MACOSX/") }
+        if let member {
+            return all.filter { $0.path.hasSuffix("/" + member) || $0.lastPathComponent == (member as NSString).lastPathComponent }
+        }
+        return all.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }
+    }
+}
+
+// MARK: - Patches folder
+
+/// A folder where you keep all your patches (loose or still in their download zips). When it's on,
+/// each game added to the list is given the patch made for it: BPS and PPF patches by checksum (they
+/// record what they were made for), xdelta and IPS patches by name.
+@MainActor
+final class PatchLibrary: ObservableObject {
+    static let shared = PatchLibrary()
+
+    @Published var folder: URL? {
+        didSet { UserDefaults.standard.set(folder?.path, forKey: "patchesFolder"); refreshCount(); lookUpWaitingGames() }
+    }
+    @Published var enabled: Bool {
+        didSet { UserDefaults.standard.set(enabled, forKey: "patchesFolderEnabled"); lookUpWaitingGames() }
+    }
+    @Published private(set) var patchCount = 0
+    @Published private(set) var isLooking = false
+
+    var active: Bool { enabled && folder != nil }
+
+    init() {
+        let d = UserDefaults.standard
+        if let p = d.string(forKey: "patchesFolder"), FileManager.default.fileExists(atPath: p) {
+            folder = URL(fileURLWithPath: p, isDirectory: true)
+        }
+        enabled = d.object(forKey: "patchesFolderEnabled") as? Bool ?? true
+        refreshCount()
+    }
+
+    struct Entry: Sendable {
+        let url: URL            // the patch file, or the zip it's in
+        let member: String?     // its path inside the zip
+        let name: String        // its file name
+        let format: PatchFormat
+        let key: String         // name in lowercase letters and digits only, for matching
+        let bps: (size: UInt64, crc: UInt32)?
+        let ppfBlock: (bytes: [UInt8], offset: UInt64)?
+    }
+
+    private func refreshCount() {
+        guard let folder else { patchCount = 0; return }
+        Task.detached { let n = PatchLibrary.index(folder).count; await MainActor.run { self.patchCount = n } }
+    }
+
+    /// Finds patches for games waiting in the list that don't have one yet.
+    func lookUpWaitingGames() {
+        let c = Converter.shared
+        lookUp(c.jobs.filter { $0.state == .queued && $0.patch == nil && !$0.isExtraction }.map { ($0.id, $0.url) })
+    }
+
+    /// Looks for a patch for each game, in the background, and gives each game the one found.
+    func lookUp(_ games: [(UUID, URL)]) {
+        guard active, let folder, !games.isEmpty else { return }
+        isLooking = true
+        let prefer = PatchLibrary.preferredLanguage
+        Task.detached {
+            let entries = PatchLibrary.index(folder)
+            var found: [(UUID, Entry)] = []
+            for (id, game) in games {
+                if let e = PatchLibrary.match(game: game, entries: entries, prefer: prefer) { found.append((id, e)) }
+            }
+            let results = found
+            await MainActor.run {
+                for (id, e) in results { Converter.shared.setFolderPatch(e.url, member: e.member, for: id) }
+                self.isLooking = false
+            }
+        }
+    }
+
+    /// The language you use on this Mac ("English"), preferred when several patches fit a game.
+    nonisolated static var preferredLanguage: String? {
+        guard let code = Locale.preferredLanguages.first.map({ Locale(identifier: $0).language.languageCode?.identifier ?? $0 }) else { return nil }
+        return Locale(identifier: "en").localizedString(forLanguageCode: code)
+    }
+
+    /// Lowercase letters and digits only: "Racing Lagoon (Japan)" → "racinglagoonjapan".
+    nonisolated static func key(_ s: String) -> String { String(s.lowercased().filter { $0.isLetter || $0.isNumber }) }
+
+    /// A game's title for matching: its name without region and other tags, as a key.
+    nonisolated static func titleKey(_ game: URL) -> String {
+        var t = game.deletingPathExtension().lastPathComponent
+        if let r = t.range(of: #"\s*[\(\[]"#, options: .regularExpression) { t = String(t[..<r.lowerBound]) }
+        return key(t)
+    }
+
+    /// Every patch in the folder (and its subfolders), including those inside zips, with what BPS and
+    /// PPF patches say they're for.
+    nonisolated static func index(_ folder: URL) -> [Entry] {
+        let files = (FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
+            .allObjects as? [URL] ?? [])
+        var entries: [Entry] = []
+        func entry(url: URL, member: String?, name: String, data: () -> Data?) -> Entry? {
+            guard let format = PatchFormat.byExtension[(name as NSString).pathExtension.lowercased()] else { return nil }
+            var bps: (UInt64, UInt32)?, ppf: ([UInt8], UInt64)?
+            if format == .bps || format == .ppf, let d = data() {
+                if format == .bps, let s = Patcher.bpsSource(d) { bps = (s.size, s.crc) }
+                if format == .ppf, let h = Patcher.ppfHeader(d), let b = h.blockCheck { ppf = (b, h.blockOffset) }
+            }
+            return Entry(url: url, member: member, name: name, format: format,
+                         key: key((name as NSString).deletingPathExtension), bps: bps, ppfBlock: ppf)
+        }
+        for f in files where !f.path.contains("/__MACOSX/") {
+            if f.pathExtension.lowercased() == "zip" {
+                for m in Converter.zipEntryNames(f) ?? [] where PatchFormat.byExtension[(m as NSString).pathExtension.lowercased()] != nil {
+                    if let e = entry(url: f, member: m, name: (m as NSString).lastPathComponent, data: { unzipMember(f, m) }) { entries.append(e) }
+                }
+            } else if let e = entry(url: f, member: nil, name: f.lastPathComponent, data: { try? Data(contentsOf: f, options: .alwaysMapped) }) {
+                entries.append(e)
+            }
+        }
+        return entries
+    }
+
+    nonisolated static func unzipMember(_ zip: URL, _ member: String) -> Data? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        p.arguments = ["-p", zip.path, member]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return p.terminationStatus == 0 ? d : nil
+    }
+
+    /// The patch for `game`: first a BPS or PPF made for one of its tracks (checked by checksum), then an
+    /// xdelta or IPS whose name contains the game's title (preferring your language). Nil if none.
+    nonisolated static func match(game: URL, entries: [Entry], prefer: String?) -> Entry? {
+        let ext = game.pathExtension.lowercased()
+        let tracks: [URL] = ext == "iso" ? [game] : (ext == "cue" || ext == "gdi") ? Array(Converter.sourceFiles(for: game).dropFirst()) : []
+        for t in tracks {
+            let size = UInt64(totalSize([t]))
+            var crc: UInt32?
+            for e in entries {
+                if let b = e.bps, b.size == size {
+                    if crc == nil { crc = Patcher.crc32(of: t) }
+                    if crc == b.crc { return e }
+                }
+                if let p = e.ppfBlock, Patcher.ppfBlockMatches(t, p.bytes, at: p.offset) { return e }
+            }
+        }
+        let title = titleKey(game)
+        guard title.count >= 5 else { return nil }   // too short to match by name safely
+        let named = entries.filter { ($0.format == .xdelta || $0.format == .ips) && $0.key.contains(title) }
+        return named.first { Patcher.tag(for: ($0.name as NSString).deletingPathExtension) == prefer } ?? named.first
     }
 }

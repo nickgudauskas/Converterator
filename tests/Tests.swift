@@ -290,6 +290,86 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         let wantTwo = [F.appendingPathComponent("two/Two (Track 1).bin"), F.appendingPathComponent("patch/two-track2-target.bin")].compactMap(sha1).joined(separator: ",")
         check(chdBin(mt.appendingPathComponent("Two (Patched).chd")) == wantTwo, "multi-track: only the track the patch was made for is changed",
               c.jobs.first?.detail ?? "")
+        // MARK: Zipped patches and the patches folder
+        // (Redump off here: the sample disc matches “Good Game” in the test DAT, which would name the CHDs.)
+        db.enabled = false
+        @MainActor func zip(_ dir: URL, _ name: String, _ files: [(from: URL, as: String)]) -> URL {
+            let stage = W.appendingPathComponent("zipstage-\(UUID().uuidString)")
+            try? fm.createDirectory(at: stage, withIntermediateDirectories: true)
+            for f in files { try! fm.copyItem(at: f.from, to: stage.appendingPathComponent(f.as)) }
+            try! "Apply with Delta Patcher.".write(to: stage.appendingPathComponent("readme.txt"), atomically: true, encoding: .utf8)
+            let out = dir.appendingPathComponent(name)
+            let p = Process(); p.executableURL = url("/usr/bin/zip"); p.currentDirectoryURL = stage
+            p.arguments = ["-q", "-r", out.path, "."]; try? p.run(); p.waitUntilExit()
+            return out
+        }
+        func waitForLookup() async { while PatchLibrary.shared.isLooking { try? await Task.sleep(for: .milliseconds(50)) } }
+        let px = F.appendingPathComponent("patch")
+        check(Patcher.patchedName(game: url("/x/Racing Lagoon (Japan).cue"), patch: url("/x/patch.xdelta"), alsoLookIn: "racinglagoon-english")
+              == "Racing Lagoon (English)", "a patch called “patch” takes its language from the zip’s name")
+
+        // A zip with a patch for another game and the right one: the right one is used
+        let zp = workspace("patch-zip", from: F, ["patch/Base.cue", "patch/Base.bin"], into: W)
+        let bundle = zip(zp, "Base English v1.zip", [(px.appendingPathComponent("Two (Fixed).xdelta"), "patch-other-game.xdelta"),
+                                                     (px.appendingPathComponent("Base (English).xdelta"), "Base (English).xdelta")])
+        check(Patcher.isPatchZip(bundle), "a zip of patches is recognised as a patch")
+        c.clearAll(); c.add([zp.appendingPathComponent("Base.cue"), bundle])
+        check(c.jobs.count == 1 && c.jobs.first?.patch == bundle, "a patch zip dropped with its game goes with it (not converted as a game)")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(zp.appendingPathComponent("Base (English).chd")) == wantPatched, "the patch in the zip that fits is applied", c.jobs.first?.detail ?? "")
+        // A patch zip next to the game with the same name is picked up
+        let zn = workspace("patch-zip-next", from: F, ["patch/Base.cue", "patch/Base.bin"], into: W)
+        _ = zip(zn, "Base.zip", [(px.appendingPathComponent("Base (BPS).bps"), "Base (BPS).bps")])
+        c.clearAll(); c.add([zn.appendingPathComponent("Base.cue")])
+        check(c.jobs.first?.patch?.lastPathComponent == "Base.zip", "a patch zip next to the game is picked up")
+
+        // Patches folder
+        let plib = PatchLibrary.shared
+        let pf = W.appendingPathComponent("patches-folder"); try? fm.createDirectory(at: pf, withIntermediateDirectories: true)
+        try! fm.copyItem(at: px.appendingPathComponent("Base (BPS).bps"), to: pf.appendingPathComponent("some unrelated name.bps"))
+        try! fm.copyItem(at: px.appendingPathComponent("Base (English).xdelta"), to: pf.appendingPathComponent("racingbaseenglish.xdelta"))
+        try! fm.copyItem(at: px.appendingPathComponent("Base (English).xdelta"), to: pf.appendingPathComponent("racingbasespanish.xdelta"))
+        plib.enabled = true
+        plib.folder = pf
+        let bf = workspace("folder-bps", from: F, ["patch/Base.cue", "patch/Base.bin"], into: W)
+        c.clearAll(); c.add([bf.appendingPathComponent("Base.cue")]); await waitForLookup()
+        check(c.jobs.first?.patch?.lastPathComponent == "some unrelated name.bps" && c.jobs.first?.patchFromFolder == true,
+              "patches folder: BPS found by checksum, whatever its name", "\(c.jobs.first?.patch?.lastPathComponent ?? "none")")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(bf.appendingPathComponent("Base (Patched).chd")) == wantPatched, "…and applied", c.jobs.first?.detail ?? "")
+        // xdelta by name: the game "Racing Base (Japan)"; English preferred over Spanish
+        let nf = W.appendingPathComponent("folder-name"); try? fm.createDirectory(at: nf, withIntermediateDirectories: true)
+        try! fm.copyItem(at: px.appendingPathComponent("Base.bin"), to: nf.appendingPathComponent("Racing Base (Japan).bin"))
+        try! "FILE \"Racing Base (Japan).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n"
+            .write(to: nf.appendingPathComponent("Racing Base (Japan).cue"), atomically: true, encoding: .utf8)
+        try? fm.removeItem(at: pf.appendingPathComponent("some unrelated name.bps"))   // so only the name can match
+        c.clearAll(); c.add([nf.appendingPathComponent("Racing Base (Japan).cue")]); await waitForLookup()
+        check(c.jobs.first?.patch?.lastPathComponent == "racingbaseenglish.xdelta", "patches folder: xdelta found by the game's name, in your language",
+              "\(c.jobs.first?.patch?.lastPathComponent ?? "none") (preferred: \(PatchLibrary.preferredLanguage ?? "?"))")
+        check(c.jobs.first?.patchedName == "Racing Base (English)", "…and the list shows “Racing Base (English).chd”")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(nf.appendingPathComponent("Racing Base (English).chd")) == wantPatched, "…and applied", c.jobs.first?.detail ?? "")
+        // A name match that doesn't fit: converted without the patch
+        let nm = W.appendingPathComponent("folder-nofit"); try? fm.createDirectory(at: nm, withIntermediateDirectories: true)
+        try! fm.copyItem(at: F.appendingPathComponent("two/Two (Track 1).bin"), to: nm.appendingPathComponent("Racing Base (Japan).bin"))
+        try! fm.copyItem(at: nf.appendingPathComponent("Racing Base (Japan).cue"), to: nm.appendingPathComponent("Racing Base (Japan).cue"))
+        c.clearAll(); c.add([nm.appendingPathComponent("Racing Base (Japan).cue")]); await waitForLookup()
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(c.jobs.first?.state == .done && exists(nm.appendingPathComponent("Racing Base (Japan).chd"))
+              && c.jobs.first?.detail.contains("didn't fit") == true, "a folder patch that doesn't fit: converted without it", c.jobs.first?.detail ?? "")
+        // PPF inside a zip in the folder, found by checksum
+        let pf2 = W.appendingPathComponent("patches-folder-2"); try? fm.createDirectory(at: pf2, withIntermediateDirectories: true)
+        _ = zip(pf2, "stuff.zip", [(px.appendingPathComponent("Base (PPF).ppf"), "random.ppf")])
+        plib.folder = pf2
+        let ppfGame = workspace("folder-ppf", from: F, ["patch/Base.cue", "patch/Base.bin"], into: W)
+        c.clearAll(); c.add([ppfGame.appendingPathComponent("Base.cue")]); await waitForLookup()
+        check(c.jobs.first?.patch?.lastPathComponent == "stuff.zip" && c.jobs.first?.patchMember == "random.ppf",
+              "patches folder: PPF inside a zip found by checksum")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(ppfGame.appendingPathComponent("Base (Patched).chd")) == wantPatched, "…and applied", c.jobs.first?.detail ?? "")
+        plib.folder = nil
+        c.clearAll()
+
         // Dropped together with its game
         let dz = workspace("patch-drop", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (BPS).bps"], into: W)
         c.clearAll(); c.add([dz.appendingPathComponent("Base.cue"), dz.appendingPathComponent("Base (BPS).bps")])
