@@ -136,6 +136,29 @@ body += struct.pack("<I", zlib.crc32(bytes(body)))
 open(f"{out}/Base (BPS).bps", "wb").write(bytes(body))
 PY
 
+# Fixes to stack on top: target.bin → target2.bin, and track 1 of the two-track game
+cp "$F/patch/target.bin" "$F/patch/target2.bin"
+printf 'BUG FIXED' | dd of="$F/patch/target2.bin" bs=1 seek=700000 conv=notrunc 2>/dev/null
+cp "$F/two/Two (Track 1).bin" "$F/patch/two-track1-target.bin"
+printf 'TRACK ONE FIX' | dd of="$F/patch/two-track1-target.bin" bs=1 seek=2000 conv=notrunc 2>/dev/null
+/usr/bin/python3 -I - "$F/patch" <<'PY'
+import sys, struct
+d = sys.argv[1]
+def ips(src, tgt, out):
+    s, t = open(src, "rb").read(), open(tgt, "rb").read()
+    recs, i = b"", 0
+    while i < len(t):
+        if s[i] != t[i]:
+            j = i
+            while j < len(t) and s[j] != t[j]: j += 1
+            recs += struct.pack(">I", i)[1:] + struct.pack(">H", j - i) + t[i:j]; i = j
+        else: i += 1
+    open(out, "wb").write(b"PATCH" + recs + b"EOF")
+ips(f"{d}/target.bin", f"{d}/target2.bin", f"{d}/bugfix.ips")
+import os
+ips(os.path.join(os.path.dirname(d), "two", "Two (Track 1).bin"), f"{d}/two-track1-target.bin", f"{d}/track1fix.ips")
+PY
+
 # A Redump DAT that knows some of these
 h() { shasum -a 1 "$1" | cut -c1-40; }
 {

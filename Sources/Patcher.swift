@@ -323,7 +323,9 @@ enum Patcher {
 
     nonisolated static func copy(_ from: URL, to: URL) throws {
         try? FileManager.default.removeItem(at: to)
-        try FileManager.default.copyItem(at: from, to: to)
+        // Copy the real file, never a link to it: patching writes to the copy, and writing through a
+        // link would change the original.
+        try FileManager.default.copyItem(at: from.resolvingSymlinksInPath(), to: to)
         // A copy of a read-only original is read-only too; the patch has to write to it.
         try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: to.path)
     }

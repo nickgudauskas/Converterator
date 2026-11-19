@@ -370,6 +370,79 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         plib.folder = nil
         c.clearAll()
 
+        // MARK: Stacked patches, patching a CHD, and patches in the Library Report
+        // Translation, then a fix on top
+        let st = workspace("stack", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (English).xdelta", "patch/bugfix.ips"], into: W)
+        c.clearAll(); c.add([st.appendingPathComponent("Base.cue")])
+        if let id = c.jobs.first?.id {
+            c.setPatch(st.appendingPathComponent("Base (English).xdelta"), for: id)
+            c.addPatch(st.appendingPathComponent("bugfix.ips"), for: id)
+        }
+        check(c.jobs.first?.morePatches.map(\.lastPathComponent) == ["bugfix.ips"], "a second patch is added after the first")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(st.appendingPathComponent("Base (English).chd")) == sha1(F.appendingPathComponent("patch/target2.bin")),
+              "stacked: translation then fix, named after the first", c.jobs.first?.detail ?? "")
+        check(sha1(st.appendingPathComponent("Base.bin")) == sha1(F.appendingPathComponent("patch/Base.bin")), "stacked: original untouched")
+        // Two tracks: xdelta changes track 2, then an IPS changes track 1 (a linked original: must be copied, not written through)
+        let st2 = workspace("stack-two", from: F, ["two/Two.cue", "two/Two (Track 1).bin", "two/Two (Track 2).bin",
+                                                   "patch/Two (Fixed).xdelta", "patch/track1fix.ips"], into: W)
+        c.clearAll(); c.add([st2.appendingPathComponent("Two.cue")])
+        if let id = c.jobs.first?.id {
+            c.setPatch(st2.appendingPathComponent("Two (Fixed).xdelta"), for: id)
+            c.addPatch(st2.appendingPathComponent("track1fix.ips"), for: id)
+        }
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        let wantBoth = [F.appendingPathComponent("patch/two-track1-target.bin"), F.appendingPathComponent("patch/two-track2-target.bin")]
+            .compactMap(sha1).joined(separator: ",")
+        check(chdBin(st2.appendingPathComponent("Two (Fixed).chd")) == wantBoth, "stacked on two tracks: each patch changes its own track",
+              c.jobs.first?.detail ?? "")
+        check(sha1(st2.appendingPathComponent("Two (Track 1).bin")) == sha1(F.appendingPathComponent("two/Two (Track 1).bin"))
+              && sha1(st2.appendingPathComponent("Two (Track 2).bin")) == sha1(F.appendingPathComponent("two/Two (Track 2).bin")),
+              "stacked on two tracks: the original tracks are untouched")
+
+        // Patching a CHD you already have
+        let pc = W.appendingPathComponent("patch-chd"); try? fm.createDirectory(at: pc, withIntermediateDirectories: true)
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: pc.appendingPathComponent("Base (Japan).chd"))   // game.bin = Base.bin
+        try! fm.copyItem(at: px.appendingPathComponent("Base (English).xdelta"), to: pc.appendingPathComponent("Base (English).xdelta"))
+        let chdBefore = sha1(pc.appendingPathComponent("Base (Japan).chd"))
+        c.clearAll(); c.add([pc.appendingPathComponent("Base (Japan).chd")])
+        check(c.jobs.first?.isExtraction == true && c.jobs.first?.patch == nil, "a CHD on its own is still extracted (no patch picked up)")
+        if let id = c.jobs.first?.id { c.setPatch(pc.appendingPathComponent("Base (English).xdelta"), for: id) }
+        check(c.jobs.first?.isExtraction == false, "…with a patch, it's patched instead")
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(pc.appendingPathComponent("Base (English).chd")) == wantPatched, "a CHD is unpacked, patched and compressed again",
+              c.jobs.first?.detail ?? "")
+        check(sha1(pc.appendingPathComponent("Base (Japan).chd")) == chdBefore, "…and the original CHD is untouched")
+
+        // Library Report: patches available
+        let rl = W.appendingPathComponent("report-patches"); try? fm.createDirectory(at: rl, withIntermediateDirectories: true)
+        try! fm.copyItem(at: px.appendingPathComponent("Base.bin"), to: rl.appendingPathComponent("Racing Base (Japan).bin"))
+        try! "FILE \"Racing Base (Japan).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n"
+            .write(to: rl.appendingPathComponent("Racing Base (Japan).cue"), atomically: true, encoding: .utf8)
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: rl.appendingPathComponent("Speed Base (Japan).chd"))
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: rl.appendingPathComponent("Done Base (Japan).chd"))
+        try! fm.copyItem(at: F.appendingPathComponent("chd/game.chd"), to: rl.appendingPathComponent("Done Base (English).chd"))
+        let rp = W.appendingPathComponent("report-patches-folder"); try? fm.createDirectory(at: rp, withIntermediateDirectories: true)
+        for n in ["racingbaseenglish", "speedbaseenglish", "donebaseenglish"] {
+            try! fm.copyItem(at: px.appendingPathComponent("Base (English).xdelta"), to: rp.appendingPathComponent("\(n).xdelta"))
+        }
+        let offers = LibraryReport.patchOffers(patchesFolder: rp, prefer: "English", outputDir: nil,
+                                               unconverted: [rl.appendingPathComponent("Racing Base (Japan).cue")], leftovers: [],
+                                               chds: ["Speed Base (Japan).chd", "Done Base (Japan).chd", "Done Base (English).chd"].map { rl.appendingPathComponent($0) })
+        check(offers.map(\.name) == ["Racing Base (English)", "Speed Base (English)"],
+              "report offers patches for a game and a CHD, not for ones already patched", "\(offers.map(\.name))")
+        // What “Convert Patched Versions” does
+        c.clearAll()
+        for o in offers {
+            c.add([o.game])
+            if let job = c.jobs.last(where: { $0.url.standardizedFileURL == o.game.standardizedFileURL }) { c.setPatch(o.patch.url, member: o.patch.member, for: job.id) }
+        }
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(rl.appendingPathComponent("Racing Base (English).chd")) == wantPatched
+              && chdBin(rl.appendingPathComponent("Speed Base (English).chd")) == wantPatched, "Convert Patched Versions makes both",
+              c.jobs.map(\.detail).joined(separator: " | "))
+        c.clearAll()
+
         // Dropped together with its game
         let dz = workspace("patch-drop", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (BPS).bps"], into: W)
         c.clearAll(); c.add([dz.appendingPathComponent("Base.cue"), dz.appendingPathComponent("Base (BPS).bps")])

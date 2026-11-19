@@ -25,6 +25,16 @@ struct LibraryReport: Sendable {
         let discs: [URL]
     }
 
+    /// A game here with a patch waiting in your patches folder.
+    struct PatchOffer: Identifiable, Sendable {
+        let id = UUID()
+        let game: URL                  // the original, or the CHD if that's all there is
+        let patch: PatchLibrary.Entry
+        let name: String               // what the patched CHD will be called
+    }
+    var patchOffers: [PatchOffer] = []
+    var patchesFolderOn = false
+
     var chds: [URL] = []
     var chdBytes = 0.0
     var redumpNamed = 0               // CHDs whose name is exactly a Redump game name
@@ -40,6 +50,7 @@ struct LibraryReport: Sendable {
 
     nonisolated static func build(folder: URL, outputDir: URL?, sevenZip: URL?, log: [String: [String]],
                                   redump: RedumpIndex, checked: [String: RedumpCache.Entry] = [:],
+                                  patchesFolder: URL? = nil, preferLanguage: String? = nil,
                                   status: @escaping @Sendable (String) -> Void) -> LibraryReport {
         var r = LibraryReport()
         let fm = FileManager.default
@@ -98,7 +109,39 @@ struct LibraryReport: Sendable {
             r.needsPlaylist += Playlist.missing(in: dir).map { NeedsPlaylist(dir: dir, name: $0.name, discs: $0.discs) }
         }
         r.needsPlaylist.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        if let patchesFolder {
+            status("Looking for patches for your games…")
+            r.patchesFolderOn = true
+            r.patchOffers = patchOffers(patchesFolder: patchesFolder, prefer: preferLanguage, outputDir: outputDir,
+                                        unconverted: unconverted, leftovers: r.leftovers, chds: r.chds)
+        }
         return r
+    }
+
+    /// Games (originals not converted yet, originals with CHDs, and CHDs on their own) with a patch in
+    /// the patches folder, leaving out ones whose patched CHD is already there and CHDs that are patched
+    /// themselves.
+    nonisolated static func patchOffers(patchesFolder: URL, prefer: String?, outputDir: URL?,
+                                        unconverted: [URL], leftovers: [Cleanup.Item], chds: [URL]) -> [PatchOffer] {
+        let entries = PatchLibrary.index(patchesFolder)
+        guard !entries.isEmpty else { return [] }
+        let covered = Set(leftovers.flatMap(\.chds).map(\.standardizedFileURL))
+        let patchedTag = "(" + (Patcher.tags.map(\.name) + ["Patched"]).joined(separator: "|") + ")"
+        let loneCHDs = chds.filter { chd in
+            !covered.contains(chd.standardizedFileURL)
+                && chd.deletingPathExtension().lastPathComponent.range(of: #"\(\#(patchedTag)\)"#, options: .regularExpression) == nil
+        }
+        var offers: [PatchOffer] = []
+        for game in unconverted + leftovers.map(\.source) + loneCHDs {
+            guard let e = PatchLibrary.match(game: game, entries: entries, prefer: prefer) else { continue }
+            let inner = e.member.map { URL(fileURLWithPath: $0) } ?? e.url
+            let name = Patcher.patchedName(game: game, patch: inner, alsoLookIn: e.member == nil ? nil : e.url.deletingPathExtension().lastPathComponent)
+            let dirs = [game.deletingLastPathComponent()] + (outputDir.map { [$0] } ?? [])
+            if dirs.contains(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent(name + ".chd").path) }) { continue }
+            offers.append(PatchOffer(game: game, patch: e, name: name))
+        }
+        return offers.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 }
 
@@ -119,9 +162,13 @@ final class Library: ObservableObject {
         let outDir = Converter.shared.outputDir, sevenZip = Converter.shared.sevenZip
         let redump = RedumpDB.shared.index
         let checked = RedumpCache.all()
+        let patches = PatchLibrary.shared.active ? PatchLibrary.shared.folder : nil
+        let prefer = PatchLibrary.preferredLanguage
         Task.detached {
             let r = LibraryReport.build(folder: folder, outputDir: outDir, sevenZip: sevenZip, log: ConversionLog.load(),
-                                        redump: redump, checked: checked) { s in Task { @MainActor in self.status = s } }
+                                        redump: redump, checked: checked, patchesFolder: patches, preferLanguage: prefer) { s in
+                Task { @MainActor in self.status = s }
+            }
             await MainActor.run { self.report = r; self.isScanning = false }
         }
     }
@@ -220,6 +267,29 @@ struct LibraryView: View {
                     .contextMenu { Button("Show in Finder") { NSWorkspace.shared.open(set.dir) } }
                 }
             } header: { header("Multi-disc games with a disc missing: \(r.missingDiscs.count)", nil, action: nil) }
+
+            Section {
+                if !r.patchesFolderOn {
+                    Text("Choose a patches folder in Settings to see which of your games have a patch waiting.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if r.patchOffers.isEmpty {
+                    Text("No patches in your patches folder for games here (or their patched CHDs already exist).").foregroundStyle(.secondary)
+                }
+                ForEach(r.patchOffers) { offer in
+                    fileRow(offer.game, title: offer.name + ".chd",
+                            detail: "from \(offer.game.lastPathComponent) with \(offer.patch.member.map { "\(offer.patch.url.lastPathComponent) → \(($0 as NSString).lastPathComponent)" } ?? offer.patch.name)")
+                }
+            } header: {
+                header("Patches available: \(r.patchOffers.count)", nil, action: r.patchOffers.isEmpty || c.isRunning ? nil : ("Convert Patched Versions", {
+                    for offer in r.patchOffers {
+                        c.add([offer.game])
+                        if let job = c.jobs.last(where: { $0.url.standardizedFileURL == offer.game.standardizedFileURL }) {
+                            c.setPatch(offer.patch.url, member: offer.patch.member, for: job.id)
+                        }
+                    }
+                    openWindow(id: "main")
+                }))
+            }
 
             Section {
                 if r.needsPlaylist.isEmpty { Text("Every multi-disc game has a playlist.").foregroundStyle(.secondary) }

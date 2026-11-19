@@ -89,7 +89,12 @@ struct Job: Identifiable {
     }
 
     /// A .chd input is extracted back to BIN/CUE (or GDI/ISO) instead of being compressed.
-    var isExtraction: Bool { url.pathExtension.lowercased() == "chd" }
+    var isCHD: Bool { url.pathExtension.lowercased() == "chd" }
+    /// A .chd is extracted back to BIN/CUE, GDI or ISO, unless it has a patch: then it's unpacked,
+    /// patched and compressed into a new, patched CHD.
+    var isExtraction: Bool { isCHD && patch == nil }
+    /// Patches applied after the first one, in order (a fix on top of a translation, say).
+    var morePatches: [URL] = []
 }
 
 /// "1.2 GB", "712 MB".
@@ -99,8 +104,9 @@ func formatBytes(_ b: Double) -> String {
 
 /// Total size of the files at these URLs (missing files count as 0).
 func totalSize(_ urls: [URL]) -> Double {
+    // (Through links: a patched copy of a disc links its unchanged tracks to the originals.)
     urls.reduce(0.0) { sum, f in
-        sum + Double(((try? FileManager.default.attributesOfItem(atPath: f.path)[.size]) as? NSNumber)?.int64Value ?? 0)
+        sum + Double(((try? FileManager.default.attributesOfItem(atPath: f.resolvingSymlinksInPath().path)[.size]) as? NSNumber)?.int64Value ?? 0)
     }
 }
 
