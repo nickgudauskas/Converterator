@@ -99,6 +99,8 @@ final class Converter: ObservableObject {
             // Universal builds bundle one copy per architecture, e.g. psxpackager/psxpackager-x86_64.
             candidates.append(res.appendingPathComponent("psxpackager/\(name)-\(arch)").path)
             candidates.append(res.appendingPathComponent("psxpackager/\(name)").path)
+            // chdman is bundled (universal) in its own folder with MAME's licenses: chdman/chdman.
+            candidates.append(res.appendingPathComponent("\(name)/\(name)").path)
             candidates.append(res.appendingPathComponent(name).path)
         }
         candidates += ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)",

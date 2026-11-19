@@ -7,6 +7,9 @@ cd "${0:A:h}"
 
 APP="Converterator.app"
 PSX_VERSION="v1.8.0"
+# chdman, built from MAME's source by .github/workflows/chdman.yml and published as a release of this repo.
+CHDMAN_VERSION="0.289"
+CHDMAN_SHA256="7a46959ffe42669e844348449b00e4fd09c268750e3f64939d0af951acf82cf7"
 
 # PSXPackager isn't stored in this repo; fetch both macOS release builds once into vendor/.
 # It's a .NET single-file app, which can't be merged with lipo, so the app carries one per CPU.
@@ -30,6 +33,20 @@ if [[ ! -f vendor/LICENSE-psxpackager ]]; then
     "https://raw.githubusercontent.com/RupertAvery/PSXPackager/$PSX_VERSION/LICENSE"
 fi
 
+# chdman: download the universal build once into vendor/, and check it's exactly the one published.
+if [[ ! -x "vendor/chdman-$CHDMAN_VERSION/chdman" ]]; then
+  echo "Downloading chdman $CHDMAN_VERSION…"
+  mkdir -p vendor
+  curl -fsSL -o "vendor/chdman-$CHDMAN_VERSION.zip" \
+    "https://github.com/nickgudauskas/Converterator/releases/download/chdman-$CHDMAN_VERSION/chdman-universal.zip"
+  if [[ "$(shasum -a 256 "vendor/chdman-$CHDMAN_VERSION.zip" | cut -d' ' -f1)" != "$CHDMAN_SHA256" ]]; then
+    echo "chdman download doesn't match the expected SHA-256"; rm -f "vendor/chdman-$CHDMAN_VERSION.zip"; exit 1
+  fi
+  rm -rf "vendor/chdman-$CHDMAN_VERSION"
+  ditto -x -k "vendor/chdman-$CHDMAN_VERSION.zip" "vendor/chdman-$CHDMAN_VERSION"
+  rm -f "vendor/chdman-$CHDMAN_VERSION.zip"
+fi
+
 rm -rf "$APP" build
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources/psxpackager"
 
@@ -48,6 +65,8 @@ cp vendor/osx-x64/psxpackager "$PSX/psxpackager-x86_64"
 cp -R vendor/osx-arm64/Resources "$PSX/Resources"   # identical in both builds
 cp vendor/LICENSE-psxpackager "$PSX/LICENSE"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
+# chdman with MAME's licenses and a note on exactly which source it was built from
+ditto "vendor/chdman-$CHDMAN_VERSION" "$APP/Contents/Resources/chdman"
 
 # App icon: compile the Icon Composer icon (light + dark variants, made by make_icon.swift).
 # actool writes Assets.car (used by macOS for appearance-aware icons) and AppIcon.icns (fallback).
@@ -113,6 +132,7 @@ if [[ -n "${SIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --options runtime \
       --entitlements psxpackager.entitlements --sign "$SIGN_IDENTITY" "$bin"
   done
+  codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP/Contents/Resources/chdman/chdman"
   codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP"
   echo "Signed with: $SIGN_IDENTITY"
 else

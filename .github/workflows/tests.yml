@@ -23,8 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install chdman
-        run: brew install rom-tools
+      # The same universal chdman the app bundles (built by chdman.yml), checked against build.sh's SHA-256,
+      # so both kinds of Mac test the exact program users get.
+      - name: Get the bundled chdman
+        run: |
+          V=$(sed -nE 's/^CHDMAN_VERSION="([^"]+)"/\1/p' build.sh)
+          SHA=$(sed -nE 's/^CHDMAN_SHA256="([^"]+)"/\1/p' build.sh)
+          curl -fsSL -o chdman.zip "https://github.com/${{ github.repository }}/releases/download/chdman-$V/chdman-universal.zip"
+          echo "$SHA  chdman.zip" | shasum -a 256 -c
+          ditto -x -k chdman.zip chdman-pkg
+          mkdir -p "$HOME/bin" && cp chdman-pkg/chdman "$HOME/bin/"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Show the machine
         run: |

@@ -75,20 +75,17 @@ Get `Converterator.zip` from the [latest release](https://github.com/nickgudausk
 
 Release builds from 1.2.1 on are signed with a Developer ID and **notarized by Apple**, so they open with a normal double-click. (Releases 1.0–1.2.0 weren't notarized and needed **System Settings → Privacy & Security → Open Anyway** the first time.)
 
-You still need to install `chdman`. See the requirements below.
+From 1.13.0, everything it needs is built in, so there's nothing else to install.
 
 ## Requirements
 
 - macOS 14 (Sonoma) or later. Apple Silicon or Intel.
-- **chdman**, from Homebrew:
-  ```bash
-  brew install rom-tools
-  ```
-  If you don't have Homebrew, install it first from [brew.sh](https://brew.sh).
 
-Nothing else is needed. PSXPackager is built into the app and carries its own copy of .NET, so you don't need to install .NET.
+That's all. Both tools Converterator uses are built into the app:
+- **chdman** (from MAME), in a universal build made from MAME's source code (see [How chdman is built](#how-chdman-is-built)).
+- **PSXPackager**, which carries its own copy of .NET.
 
-If `chdman` can't be found, a banner at the top of the window explains how to install it, with buttons to copy the command and open Terminal. It disappears by itself once `chdman` is installed.
+Converterator uses its built-in chdman. If that's ever missing, it falls back to one installed with Homebrew (`brew install rom-tools`), and if there's none, a banner explains how to install it. Releases before 1.13.0 didn't include chdman and needed the Homebrew one.
 
 ## Building
 
@@ -158,7 +155,8 @@ swift make_icon.swift
 | File | Purpose |
 |---|---|
 | `Sources/` | The app's Swift code, one file per area: `Converter.swift` (the conversion queue, PSXPackager and `chdman`), `Redump.swift` (DATs, matching, downloads, remembered results), `Cleanup.swift`, `CHDCheck.swift`, `LibraryReport.swift`, `Playlist.swift`, `Updates.swift`, the windows (`ContentView.swift`, `SettingsView.swift`) and `App.swift` (entry point, menus, Finder service). |
-| `tests/test.sh`, `tests/Tests.swift` | The tests (see below). |
+| `tests/test.sh`, `tests/Tests.swift` | The tests (see below). Run on every push by `.github/workflows/tests.yml`, on an Apple Silicon and an Intel Mac. |
+| `.github/workflows/chdman.yml` | Builds the bundled universal chdman from MAME's source (see [How chdman is built](#how-chdman-is-built)). |
 | `release.sh` | Tests, builds, notarizes and publishes a release (see below). |
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
 | `notarize.sh` | Builds with Developer ID signing, notarizes with Apple, staples, and zips into `dist/`. |
@@ -172,8 +170,14 @@ swift make_icon.swift
 - [PSXPackager](https://github.com/RupertAvery/PSXPackager) by RupertAvery, for PBP extraction.
 - [chdman](https://docs.mamedev.org/tools/chdman.html) from the MAME project, for CHD compression.
 
-Converterator doesn't modify either tool. It runs them as separate programs. `chdman` isn't included; you install it yourself. The built app includes an unmodified copy of PSXPackager, which `build.sh` downloads.
+Converterator doesn't modify either tool. It runs them as separate programs, and the app includes an unmodified copy of each, which `build.sh` downloads.
+
+### How chdman is built
+
+MAME's developers only publish chdman for Windows, and Homebrew's copy depends on other Homebrew libraries, so Converterator builds its own. The [Build chdman](.github/workflows/chdman.yml) workflow downloads the official MAME source for one version, builds only MAME's tools on GitHub's Apple Silicon and Intel Macs (with MAME's own copies of its compression libraries and the native macOS layer, so it needs nothing but macOS), checks that nothing outside macOS is linked, combines the two into one universal program with `lipo`, and publishes it with MAME's licenses as a [`chdman-…` release](https://github.com/nickgudauskas/Converterator/releases?q=chdman) of this repository (not marked as the latest release, so the app's update check ignores it). A `SOURCE.txt` inside names the exact MAME source archive, its SHA-256 and the workflow run. `build.sh` downloads that release, checks it against the SHA-256 in `build.sh`, and puts it in `Contents/Resources/chdman` along with MAME's licenses.
+
+To move to a newer MAME: run **Actions → Build chdman → Run workflow** with the new version, then update `CHDMAN_VERSION` and `CHDMAN_SHA256` in `build.sh`.
 
 ## License
 
-Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. chdman is part of MAME and keeps its own license.
+Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.
