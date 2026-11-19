@@ -243,6 +243,19 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
                 .filter { $0.pathExtension == "bin" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
             return bins.compactMap(sha1).joined(separator: ",")
         }
+        let patchNames: [(game: String, patch: String, redump: String?, want: String)] = [
+            ("Racing Lagoon (Japan).cue", "racinglagoonenglish.xdelta", nil, "Racing Lagoon (English)"),
+            ("racinglagoon.cue", "racinglagoonenglish.xdelta", "Racing Lagoon (Japan)", "Racing Lagoon (English)"),
+            ("Game (Japan) (Disc 1).cue", "game_t-es_v1.0.ppf", nil, "Game (Spanish)"),
+            ("Game (Japan).cue", "GAME-PTBR.xdelta", nil, "Game (Portuguese)"),
+            ("Game (Japan).cue", "game-undub.xdelta", nil, "Game (Undub)"),
+            ("Game (Japan).cue", "fix.ips", nil, "Game (Patched)"),
+            ("Game (Japan).cue", "Tengai Makyou Zero (English) v1.1.xdelta", nil, "Tengai Makyou Zero (English) v1.1"),
+        ]
+        for n in patchNames {
+            let got = Patcher.patchedName(game: url("/x/\(n.game)"), patch: url("/x/\(n.patch)"), redumpGame: n.redump)
+            check(got == n.want, "“\(n.patch)” on “\(n.redump ?? n.game)” → “\(n.want)”", "got “\(got)”")
+        }
         let wantPatched = sha1(F.appendingPathComponent("patch/target.bin"))
         check(Converter.findTool("xdelta3") != nil, "xdelta3 found")
         for (patchName, chdName) in [("Base (English).xdelta", "Base (English).chd"), ("Base (IPS).ips", "Base (IPS).chd"),
@@ -275,7 +288,7 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         check(c.jobs.first?.patch?.lastPathComponent == "Two.xdelta", "a patch next to the game with the same name is picked up")
         c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
         let wantTwo = [F.appendingPathComponent("two/Two (Track 1).bin"), F.appendingPathComponent("patch/two-track2-target.bin")].compactMap(sha1).joined(separator: ",")
-        check(chdBin(mt.appendingPathComponent("Two.chd")) == wantTwo, "multi-track: only the track the patch was made for is changed",
+        check(chdBin(mt.appendingPathComponent("Two (Patched).chd")) == wantTwo, "multi-track: only the track the patch was made for is changed",
               c.jobs.first?.detail ?? "")
         // Dropped together with its game
         let dz = workspace("patch-drop", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (BPS).bps"], into: W)

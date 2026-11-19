@@ -478,7 +478,7 @@ final class Converter: ObservableObject {
         // already there and won't be rewritten.
         let patch = job.patch
         if let patch, !fm.fileExists(atPath: patch.path) { return fail("Can't find the patch \(patch.lastPathComponent)") }
-        let outName = patch.map { Converter.safeFileName($0.deletingPathExtension().lastPathComponent) }
+        let outName = patch.map { Patcher.patchedName(game: src, patch: $0) }
             ?? src.deletingPathExtension().lastPathComponent
         let alreadyThere = !overwrite && Converter.inputExtensions.contains(src.pathExtension.lowercased())
             && src.pathExtension.lowercased() != "pbp"
@@ -604,10 +604,12 @@ final class Converter: ObservableObject {
             redump = r
         }
         // Optional: name the CHD after the Redump game it matches, e.g. "Armored Core (USA).chd".
-        // A patched game is named after its patch ("Game (English).xdelta" → "Game (English).chd").
+        // A patched game is named for what it is, e.g. "Racing Lagoon (English)" (see Patcher.patchedName).
         var chdBase = base
         if let patch {
-            chdBase = Converter.safeFileName(patch.deletingPathExtension().lastPathComponent)
+            var redumpGame: String?
+            if case .match(let g) = redump { redumpGame = g }
+            chdBase = Patcher.patchedName(game: src, patch: patch, redumpGame: redumpGame)
         } else if case .match(let game) = redump, RedumpDB.shared.renameToRedump {
             let named = Converter.safeFileName(game)
             if named != base { append("  naming it after Redump: \(named).chd"); chdBase = named }

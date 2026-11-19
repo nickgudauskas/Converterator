@@ -238,7 +238,7 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(job.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         if let patch = job.patch {
-                            Label("Patch: \(patch.lastPathComponent) → \(Converter.safeFileName(patch.deletingPathExtension().lastPathComponent)).chd",
+                            Label("Patch: \(patch.lastPathComponent) → \(Patcher.patchedName(game: job.url, patch: patch)).chd",
                                   systemImage: "bandage")
                                 .font(.caption).foregroundStyle(Color.accentColor)
                                 .lineLimit(1).truncationMode(.middle)

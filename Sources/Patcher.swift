@@ -16,6 +16,55 @@ enum PatchFormat: String, Sendable {
 enum Patcher {
     struct Failure: Error, Sendable { let message: String }
 
+    // MARK: Naming
+
+    /// The name for a patched game's CHD, e.g. "Racing Lagoon (English)".
+    /// A patch already named like a title ("Tengai Makyou Zero (English)": spaces and capitals) keeps its
+    /// name. Otherwise ("racinglagoonenglish", "rl_t-en_v1") it's the game's title, from Redump's name for
+    /// the original dump if it matched, else the original file's name, without its region and other tags,
+    /// plus what the patch is for: a language, "Undub", or "Patched".
+    nonisolated static func patchedName(game: URL, patch: URL, redumpGame: String? = nil) -> String {
+        let patchName = patch.deletingPathExtension().lastPathComponent
+        if patchName.contains(" ") && patchName.contains(where: \.isUppercase) {
+            return Converter.safeFileName(patchName)
+        }
+        var title = redumpGame ?? game.deletingPathExtension().lastPathComponent
+        if let r = title.range(of: #"\s*[\(\[]"#, options: .regularExpression) { title = String(title[..<r.lowerBound]) }
+        title = title.trimmingCharacters(in: .whitespaces)
+        if title.isEmpty { title = game.deletingPathExtension().lastPathComponent }
+        return Converter.safeFileName("\(title) (\(tag(for: patchName) ?? "Patched"))")
+    }
+
+    /// Languages (and undubs) as they show up in patch names. Full words are found even run together
+    /// with other words ("racinglagoonenglish"); short codes only on their own ("rl_en_v1", "T-En").
+    nonisolated static let tags: [(name: String, words: [String], codes: [String])] = [
+        ("English", ["english"], ["en", "eng"]),
+        ("Spanish", ["spanish", "espanol", "español"], ["es", "esp", "spa"]),
+        ("French", ["french", "francais", "français"], ["fr", "fra", "fre"]),
+        ("German", ["german", "deutsch"], ["de", "ger", "deu"]),
+        ("Italian", ["italian", "italiano"], ["it", "ita"]),
+        ("Portuguese", ["portuguese", "portugues", "português"], ["pt", "ptbr", "por", "br"]),
+        ("Russian", ["russian"], ["ru", "rus"]),
+        ("Polish", ["polish", "polski"], ["pl", "pol"]),
+        ("Chinese", ["chinese"], ["zh", "chi", "chs", "cht"]),
+        ("Korean", ["korean"], ["ko", "kor"]),
+        ("Undub", ["undub", "undubbed"], []),
+    ]
+
+    nonisolated static func tag(for patchName: String) -> String? {
+        let lower = patchName.lowercased()
+        // "T-En" / "T_En" / "(T-En)" translation tags, then words and codes
+        let tokens = lower.split(whereSeparator: { !$0.isLetter }).map(String.init)
+        let translated = lower.range(of: #"t[-_ ]([a-z]{2,3})\b"#, options: .regularExpression)
+            .map { String(lower[$0].dropFirst(2)) }
+        for t in tags {
+            if let code = translated, t.codes.contains(code) { return t.name }
+        }
+        for t in tags where t.words.contains(where: { lower.contains($0) }) { return t.name }
+        for t in tags where t.codes.contains(where: { tokens.contains($0) }) { return t.name }
+        return nil
+    }
+
     /// A patch next to `game` with the same name (Game.xdelta beside Game.cue), if there is one.
     nonisolated static func findPatch(for game: URL) -> URL? {
         let base = game.deletingPathExtension()
