@@ -6,6 +6,7 @@
 #   4. builds, signs, notarizes and staples (notarize.sh)
 #   5. commits the version change, pushes, and publishes the GitHub release with the zip
 #   6. downloads the release back and checks its checksum, signature, notarization and version
+#   7. updates the Homebrew cask in nickgudauskas/homebrew-tap to the new version
 #
 # Usage:  ./release.sh 1.12.0 [notes.md] [--dry-run]
 #   notes.md   release notes (Markdown). Without it, the commit messages since the last release are used.
@@ -109,6 +110,25 @@ spctl --assess --type execute "$T/x/Converterator.app" || fail "Gatekeeper rejec
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$T/x/Converterator.app/Contents/Info.plist")" == "$VERSION" ]] \
   || fail "The downloaded app has the wrong version."
 [[ "$(gh api "repos/$REPO/releases/latest" --jq .tag_name)" == "v$VERSION" ]] || fail "GitHub doesn't list v$VERSION as the latest release."
+
+# 7. Homebrew cask (brew install --cask nickgudauskas/tap/converterator). The release is already out,
+# so a problem here only warns.
+step "Updating the Homebrew cask"
+TAP="$T/homebrew-tap"
+if gh repo clone nickgudauskas/homebrew-tap "$TAP" -- -q 2>/dev/null; then
+  CASK="$TAP/Casks/converterator.rb"
+  sed -i '' -E "s/^  version \"[^\"]+\"/  version \"$VERSION\"/; s/^  sha256 \"[0-9a-f]+\"/  sha256 \"$SHA\"/" "$CASK"
+  if grep -q "version \"$VERSION\"" "$CASK" && grep -q "sha256 \"$SHA\"" "$CASK"; then
+    git -C "$TAP" config user.name "$(git config user.name)"
+    git -C "$TAP" config user.email "$(git config user.email)"
+    git -C "$TAP" commit -q -am "Update converterator to $VERSION" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" \
+      && git -C "$TAP" push -q && print "Cask updated to $VERSION." || print -P "%F{yellow}! Couldn't push the cask update.%f"
+  else
+    print -P "%F{yellow}! The cask wasn't in the expected format; update it by hand.%f"
+  fi
+else
+  print -P "%F{yellow}! Couldn't get nickgudauskas/homebrew-tap; update the cask by hand.%f"
+fi
 
 print -P "\n%F{green}✓ Released $VERSION%f: https://github.com/$REPO/releases/tag/v$VERSION"
 print "SHA-256 $SHA. Update this Mac with Check for Updates → Install and Relaunch."
