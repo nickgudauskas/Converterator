@@ -1,0 +1,124 @@
+# Builds a universal (Apple Silicon + Intel) dolphin-tool from Dolphin's official source and publishes it as
+# a release of this repository ("dolphin-tool-2609b"), which build.sh downloads and bundles inside the app
+# for GameCube and Wii discs (RVZ). Dolphin's macOS download doesn't include dolphin-tool, so it's built here.
+# Run it by hand (Actions → Build dolphin-tool → Run workflow) when moving to a new Dolphin release.
+name: Build dolphin-tool
+
+on:
+  workflow_dispatch:
+    inputs:
+      dolphin_version:
+        description: "Dolphin release tag (e.g. 2609b)"
+        required: true
+        default: "2609b"
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-15
+          - arch: x86_64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - name: Get Dolphin ${{ inputs.dolphin_version }} source (with its bundled libraries)
+        run: |
+          git clone --depth 1 --branch "${{ inputs.dolphin_version }}" --recurse-submodules --shallow-submodules \
+            https://github.com/dolphin-emu/dolphin.git dolphin
+          git -C dolphin rev-parse HEAD | tee source.commit
+
+      - name: Build dolphin-tool only
+        # No GUI, graphics backends, online services or tests: just the disc-image tool and what it needs.
+        run: |
+          brew install ninja
+          cmake -S dolphin -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DENABLE_CLI_TOOL=ON -DENABLE_QT=OFF -DENABLE_NOGUI=OFF -DENABLE_TESTS=OFF \
+            -DENABLE_VULKAN=OFF -DUSE_BUNDLED_MOLTENVK=OFF -DENABLE_SDL=OFF -DENABLE_CUBEB=OFF -DENABLE_LLVM=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF -DUSE_MGBA=OFF -DUSE_UPNP=OFF -DUSE_RETRO_ACHIEVEMENTS=OFF \
+            -DENABLE_AUTOUPDATE=OFF -DENABLE_ANALYTICS=OFF -DMACOS_CODE_SIGNING=OFF
+          cmake --build build --target dolphin-tool
+          TOOL=$(find build -type f -name dolphin-tool -perm -u+x | head -1)
+          cp "$TOOL" dolphin-tool
+          file dolphin-tool
+          otool -L dolphin-tool
+
+      - name: Smoke test (a minimal GameCube image to RVZ and back)
+        run: |
+          python3 - <<'PY'
+          import struct
+          data = bytearray(4 * 1024 * 1024)
+          data[0:6] = b"GTEST1"                    # game ID
+          data[0x1C:0x20] = struct.pack(">I", 0xC2339F3D)   # GameCube disc magic
+          data[0x20:0x30] = b"Converterator CI"
+          for i in range(0x440, len(data), 4096): data[i] = (i // 4096) & 0xFF
+          open("gc.iso", "wb").write(data)
+          PY
+          ./dolphin-tool convert -i gc.iso -o gc.rvz -f rvz -c zstd -l 5 -b 131072
+          ./dolphin-tool convert -i gc.rvz -o back.iso -f iso
+          cmp gc.iso back.iso && echo "round trip OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-tool-${{ matrix.arch }}
+          path: |
+            dolphin-tool
+            source.commit
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Combine into one universal dolphin-tool
+        run: |
+          lipo -create dolphin-tool-arm64/dolphin-tool dolphin-tool-x86_64/dolphin-tool -output dolphin-tool
+          chmod +x dolphin-tool
+          lipo -info dolphin-tool
+          # Nothing outside macOS itself may be linked (only the indented lines are libraries).
+          if otool -L dolphin-tool | grep -E "^\s+/" | grep -vE "^\s+/(System/Library|usr/lib)/"; then
+            echo "dolphin-tool links a library that isn't part of macOS"; exit 1
+          fi
+          if otool -L dolphin-tool | grep -E "^\s+@"; then echo "dolphin-tool expects bundled libraries"; exit 1; fi
+
+      - name: Package with Dolphin's license
+        run: |
+          V="${{ inputs.dolphin_version }}"
+          COMMIT=$(cat dolphin-tool-arm64/source.commit)
+          mkdir -p pkg
+          cp dolphin-tool pkg/
+          curl -fsSL -o pkg/COPYING "https://raw.githubusercontent.com/dolphin-emu/dolphin/${V}/COPYING"
+          cat > pkg/SOURCE.txt <<EOF
+          dolphin-tool from Dolphin ${V}, built from the unmodified source:
+            https://github.com/dolphin-emu/dolphin/tree/${V}  (commit ${COMMIT}, with its submodules)
+
+          Built by this GitHub Actions run:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          on an Apple Silicon and an Intel Mac (CMake target dolphin-tool, with the GUI, graphics backends and
+          online features turned off), combined with lipo.
+
+          Dolphin is free software under the GNU General Public License, version 2 or later (see COPYING).
+          EOF
+          sed -i '' 's/^          //' pkg/SOURCE.txt
+          (cd pkg && zip -qr ../dolphin-tool-universal.zip .)
+          shasum -a 256 dolphin-tool-universal.zip | tee dolphin-tool-universal.zip.sha256
+
+      - name: Publish as a release (not marked latest, so the app's update check ignores it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.dolphin_version }}"
+          SHA=$(cut -d' ' -f1 dolphin-tool-universal.zip.sha256)
+          gh release delete "dolphin-tool-${V}" -R "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "dolphin-tool-${V}" dolphin-tool-universal.zip -R "${{ github.repository }}" \
+            --title "dolphin-tool ${V} (universal, for bundling)" --latest=false --target "${{ github.sha }}" \
+            --notes "Universal (Apple Silicon + Intel) dolphin-tool built from the unmodified source of [Dolphin ${V}](https://github.com/dolphin-emu/dolphin/tree/${V}) by [this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). \`build.sh\` downloads it and bundles it inside Converterator for GameCube and Wii discs. Includes Dolphin's license and a SOURCE.txt saying exactly how it was built.
+
+          SHA-256 of \`dolphin-tool-universal.zip\`: \`${SHA}\`"
