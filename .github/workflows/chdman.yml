@@ -1,0 +1,114 @@
+# Builds a universal (Apple Silicon + Intel) chdman from MAME's official source and publishes it as a
+# release of this repository ("chdman-0.289"), which build.sh downloads and bundles inside the app.
+# Run it by hand (Actions → Build chdman → Run workflow) when moving to a new MAME version.
+name: Build chdman
+
+on:
+  workflow_dispatch:
+    inputs:
+      mame_version:
+        description: "MAME version, without the dot (0289 = 0.289)"
+        required: true
+        default: "0289"
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-15
+          - arch: x86_64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Download MAME ${{ inputs.mame_version }} source
+        run: |
+          curl -fsSL -o mame.tar.gz "https://github.com/mamedev/mame/archive/refs/tags/mame${{ inputs.mame_version }}.tar.gz"
+          shasum -a 256 mame.tar.gz | tee source.sha256
+          tar -xzf mame.tar.gz
+          mv "mame-mame${{ inputs.mame_version }}" mame
+
+      - name: Build chdman
+        working-directory: mame
+        # Tools only (no emulator), with MAME's own copies of zlib, zstd, FLAC, LZMA and utf8proc built in,
+        # and the native macOS layer instead of SDL, so the result needs nothing but macOS itself.
+        run: |
+          make TOOLS=1 EMULATOR=0 OSD=mac NO_USE_MIDI=1 NO_USE_PORTAUDIO=1 NOWERROR=1 \
+            MACOSX_DEPLOYMENT_TARGET=14.0 ARCHOPTS="-mmacosx-version-min=14.0" \
+            -j"$(sysctl -n hw.ncpu)"
+          ls -l chdman
+          file chdman
+          otool -L chdman
+          ./chdman | head -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chdman-${{ matrix.arch }}
+          path: |
+            mame/chdman
+            source.sha256
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Combine into one universal chdman
+        run: |
+          lipo -create chdman-arm64/mame/chdman chdman-x86_64/mame/chdman -output chdman
+          chmod +x chdman
+          lipo -info chdman
+          # Nothing outside macOS itself may be linked.
+          if otool -L chdman | tail -n +2 | grep -vE "^\s*/(System/Library|usr/lib)/"; then
+            echo "chdman links a library that isn't part of macOS"; exit 1
+          fi
+          ./chdman | head -1
+
+      - name: Package with MAME's licenses
+        run: |
+          V="${{ inputs.mame_version }}"
+          DOT="${V:0:1}.${V:1}"
+          curl -fsSL -o mame.tar.gz "https://github.com/mamedev/mame/archive/refs/tags/mame${V}.tar.gz"
+          tar -xzf mame.tar.gz "mame-mame${V}/COPYING" "mame-mame${V}/docs/legal"
+          mkdir -p pkg/legal
+          cp chdman pkg/
+          cp "mame-mame${V}/COPYING" pkg/COPYING
+          cp -R "mame-mame${V}/docs/legal/." pkg/legal/
+          cat > pkg/SOURCE.txt <<EOF
+          chdman ${DOT}, built from the unmodified source of MAME ${DOT}:
+            https://github.com/mamedev/mame/releases/tag/mame${V}
+            https://github.com/mamedev/mame/archive/refs/tags/mame${V}.tar.gz
+            SHA-256 of that archive: $(cut -d' ' -f1 chdman-arm64/source.sha256)
+
+          Built by this GitHub Actions run:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          with:
+            make TOOLS=1 EMULATOR=0 OSD=mac NO_USE_MIDI=1 NO_USE_PORTAUDIO=1 NOWERROR=1 MACOSX_DEPLOYMENT_TARGET=14.0
+          on an Apple Silicon and an Intel Mac, combined with lipo.
+
+          MAME is free software under the GNU General Public License (see COPYING and legal/).
+          chdman's own source file is BSD-3-Clause.
+          EOF
+          sed -i '' 's/^          //' pkg/SOURCE.txt
+          (cd pkg && zip -qr ../chdman-universal.zip .)
+          shasum -a 256 chdman-universal.zip | tee chdman-universal.zip.sha256
+
+      - name: Publish as a release (not marked latest, so the app's update check ignores it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.mame_version }}"
+          DOT="${V:0:1}.${V:1}"
+          SHA=$(cut -d' ' -f1 chdman-universal.zip.sha256)
+          gh release delete "chdman-${DOT}" -R "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "chdman-${DOT}" chdman-universal.zip -R "${{ github.repository }}" \
+            --title "chdman ${DOT} (universal, for bundling)" --latest=false --target "${{ github.sha }}" \
+            --notes "Universal (Apple Silicon + Intel) chdman built from the unmodified source of [MAME ${DOT}](https://github.com/mamedev/mame/releases/tag/mame${V}) by [this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). \`build.sh\` downloads it and bundles it inside Converterator. Includes MAME's licenses and a SOURCE.txt saying exactly how it was built.
+
+          SHA-256 of \`chdman-universal.zip\`: \`${SHA}\`"
