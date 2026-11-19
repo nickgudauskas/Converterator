@@ -35,8 +35,10 @@ jobs:
         # No GUI, graphics backends, online services or tests: just the disc-image tool and what it needs.
         run: |
           brew install ninja
+          # USE_SYSTEM_LIBS=OFF: Dolphin's own copies of zstd, lz4, lzo, libusb etc., built in, not the
+          # Homebrew ones that happen to be on the runner (those wouldn't be on other Macs).
           cmake -S dolphin -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DUSE_SYSTEM_LIBS=OFF \
             -DENABLE_CLI_TOOL=ON -DENABLE_QT=OFF -DENABLE_NOGUI=OFF -DENABLE_TESTS=OFF \
             -DENABLE_VULKAN=OFF -DUSE_BUNDLED_MOLTENVK=OFF -DENABLE_SDL=OFF -DENABLE_CUBEB=OFF -DENABLE_LLVM=OFF \
             -DUSE_DISCORD_PRESENCE=OFF -DUSE_MGBA=OFF -DUSE_UPNP=OFF -DUSE_RETRO_ACHIEVEMENTS=OFF \
