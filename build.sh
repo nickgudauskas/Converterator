@@ -154,8 +154,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.converterator</string>
   <key>CFBundleExecutable</key><string>Converterator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.19.0</string>
-  <key>CFBundleVersion</key><string>26</string>
+  <key>CFBundleShortVersionString</key><string>1.20.0</string>
+  <key>CFBundleVersion</key><string>27</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
