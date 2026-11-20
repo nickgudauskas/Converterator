@@ -220,14 +220,44 @@ struct ContentView: View {
     }
 
     private var dropPrompt: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "opticaldisc").font(.system(size: 48)).foregroundStyle(.secondary)
-            Text("Drop disc images or folders here").font(.title3)
-            Text("BIN/CUE, GDI and ISO images are compressed to CHD; GameCube and Wii discs (ISO, GCM, WBFS, CISO, GCZ, WIA) to RVZ. PBPs and zip or 7z archives are unpacked first, and those temporary files are cleaned up. Drop a .chd or .rvz to turn it back into BIN/CUE, GDI or ISO.")
-                .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button("Add Files…", action: pickFiles).padding(.top, 4)
+        // Scrolls rather than overlapping when the window is short; centred when there's room.
+        GeometryReader { geo in
+            ScrollView {
+                VStack(spacing: 14) {
+                    Image(systemName: "opticaldisc").font(.system(size: 44)).foregroundStyle(.secondary)
+                    Text("Drop disc images or folders here").font(.title3)
+                    Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 7) {
+                        if c.outputFormat == .pbp {
+                            formatRow("PlayStation discs", "BIN/CUE, ISO, ECM, CHD", "PBP")
+                        } else {
+                            formatRow("CD and DVD images", "BIN/CUE, GDI, ISO, ECM", "CHD")
+                            formatRow("GameCube and Wii", "ISO, GCM, WBFS, CISO, GCZ, WIA", "RVZ")
+                            formatRow("PS1 Classics", "PBP", "CHD")
+                        }
+                        formatRow("Archives", "ZIP, 7Z, RAR", "unpacked, then converted")
+                        if c.outputFormat != .pbp {
+                            formatRow("Back again", "CHD, RVZ", "BIN/CUE, GDI or ISO")
+                        }
+                    }
+                    .font(.callout)
+                    .padding(.vertical, 12).padding(.horizontal, 16)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                    Button("Add Files…", action: pickFiles).padding(.top, 2)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, minHeight: geo.size.height)
+            }
         }
-        .padding(30)
+    }
+
+    /// One line of the drop prompt: "CD and DVD images   BIN/CUE, GDI, ISO, ECM  →  CHD".
+    private func formatRow(_ kind: String, _ formats: String, _ result: String) -> some View {
+        GridRow {
+            Text(kind).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+            Text(formats)
+            Image(systemName: "arrow.right").foregroundStyle(.tertiary)
+            Text(result).fontWeight(.medium)
+        }
     }
 
     private var jobList: some View {
