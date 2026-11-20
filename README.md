@@ -90,10 +90,10 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 With [Homebrew](https://brew.sh):
 
 ```bash
-brew install --cask nickgudauskas/tap/converterator
+brew install --cask thepoisonninja/tap/converterator
 ```
 
-Or get `Converterator.zip` from the [latest release](https://github.com/nickgudauskas/Converterator/releases/latest), unzip it, and move **Converterator.app** to your Applications folder. The app is **universal**: the same download runs natively on both Apple Silicon and Intel Macs.
+Or get `Converterator.zip` from the [latest release](https://github.com/thepoisonninja/Converterator/releases/latest), unzip it, and move **Converterator.app** to your Applications folder. The app is **universal**: the same download runs natively on both Apple Silicon and Intel Macs.
 
 Release builds from 1.2.1 on are signed with a Developer ID and **notarized by Apple**, so they open with a normal double-click. (Releases 1.0–1.2.0 weren't notarized and needed **System Settings → Privacy & Security → Open Anyway** the first time.)
 
@@ -117,7 +117,7 @@ Converterator uses its built-in chdman. If that's ever missing, it falls back to
 You need Xcode or the Xcode Command Line Tools (for `swiftc` and `codesign`).
 
 ```bash
-git clone https://github.com/nickgudauskas/Converterator.git
+git clone https://github.com/thepoisonninja/Converterator.git
 cd Converterator
 ./build.sh
 ```
@@ -207,7 +207,7 @@ Converterator doesn't modify any of these tools. It runs them as separate progra
 
 ### How chdman is built
 
-MAME's developers only publish chdman for Windows, and Homebrew's copy depends on other Homebrew libraries, so Converterator builds its own. The [Build chdman](.github/workflows/chdman.yml) workflow downloads the official MAME source for one version, builds only MAME's tools on GitHub's Apple Silicon and Intel Macs (with MAME's own copies of its compression libraries and the native macOS layer, so it needs nothing but macOS), checks that nothing outside macOS is linked, combines the two into one universal program with `lipo`, and publishes it with MAME's licenses as a [`chdman-…` release](https://github.com/nickgudauskas/Converterator/releases?q=chdman) of this repository (not marked as the latest release, so the app's update check ignores it). A `SOURCE.txt` inside names the exact MAME source archive, its SHA-256 and the workflow run. `build.sh` downloads that release, checks it against the SHA-256 in `build.sh`, and puts it in `Contents/Resources/chdman` along with MAME's licenses.
+MAME's developers only publish chdman for Windows, and Homebrew's copy depends on other Homebrew libraries, so Converterator builds its own. The [Build chdman](.github/workflows/chdman.yml) workflow downloads the official MAME source for one version, builds only MAME's tools on GitHub's Apple Silicon and Intel Macs (with MAME's own copies of its compression libraries and the native macOS layer, so it needs nothing but macOS), checks that nothing outside macOS is linked, combines the two into one universal program with `lipo`, and publishes it with MAME's licenses as a [`chdman-…` release](https://github.com/thepoisonninja/Converterator/releases?q=chdman) of this repository (not marked as the latest release, so the app's update check ignores it). A `SOURCE.txt` inside names the exact MAME source archive, its SHA-256 and the workflow run. `build.sh` downloads that release, checks it against the SHA-256 in `build.sh`, and puts it in `Contents/Resources/chdman` along with MAME's licenses.
 
 To move to a newer MAME: run **Actions → Build chdman → Run workflow** with the new version, then update `CHDMAN_VERSION` and `CHDMAN_SHA256` in `build.sh`.
 

@@ -50,7 +50,7 @@ if [[ ! -x "vendor/chdman-$CHDMAN_VERSION/chdman" ]]; then
   echo "Downloading chdman $CHDMAN_VERSION…"
   mkdir -p vendor
   curl -fsSL -o "vendor/chdman-$CHDMAN_VERSION.zip" \
-    "https://github.com/nickgudauskas/Converterator/releases/download/chdman-$CHDMAN_VERSION/chdman-universal.zip"
+    "https://github.com/thepoisonninja/Converterator/releases/download/chdman-$CHDMAN_VERSION/chdman-universal.zip"
   if [[ "$(shasum -a 256 "vendor/chdman-$CHDMAN_VERSION.zip" | cut -d' ' -f1)" != "$CHDMAN_SHA256" ]]; then
     echo "chdman download doesn't match the expected SHA-256"; rm -f "vendor/chdman-$CHDMAN_VERSION.zip"; exit 1
   fi
@@ -103,7 +103,7 @@ DT="vendor/dolphin-tool-$DOLPHIN_VERSION"
 if [[ ! -x "$DT/dolphin-tool" ]]; then
   echo "Downloading dolphin-tool $DOLPHIN_VERSION…"
   mkdir -p vendor
-  curl -fsSL -o "$DT.zip" "https://github.com/nickgudauskas/Converterator/releases/download/dolphin-tool-$DOLPHIN_VERSION/dolphin-tool-universal.zip"
+  curl -fsSL -o "$DT.zip" "https://github.com/thepoisonninja/Converterator/releases/download/dolphin-tool-$DOLPHIN_VERSION/dolphin-tool-universal.zip"
   if [[ "$(shasum -a 256 "$DT.zip" | cut -d' ' -f1)" != "$DOLPHIN_SHA256" ]]; then
     echo "dolphin-tool download doesn't match the expected SHA-256"; rm -f "$DT.zip"; exit 1
   fi

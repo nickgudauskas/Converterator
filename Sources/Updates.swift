@@ -11,7 +11,7 @@ import CryptoKit
 @MainActor
 final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
-    static let repo = "nickgudauskas/Converterator"
+    static let repo = "thepoisonninja/Converterator"
     nonisolated static let bundleID = "local.converterator"
 
     @Published var isChecking = false
