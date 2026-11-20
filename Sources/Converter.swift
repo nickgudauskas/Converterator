@@ -43,6 +43,60 @@ final class Converter: ObservableObject {
     @Published var pbpFolders: Bool {
         didSet { UserDefaults.standard.set(pbpFolders, forKey: "pbpFolders") }
     }
+    /// Add converted games to RetroArch's playlists (one per system).
+    @Published var retroArchPlaylists: Bool {
+        didSet { UserDefaults.standard.set(retroArchPlaylists, forKey: "retroArchPlaylists") }
+    }
+    /// Where RetroArch's playlists are; nil means RetroArch's usual folder.
+    @Published var retroArchFolder: URL? {
+        didSet { UserDefaults.standard.set(retroArchFolder?.path, forKey: "retroArchFolder") }
+    }
+    var retroArchPlaylistFolder: URL { retroArchFolder ?? RetroArch.defaultFolder }
+
+    func addToRetroArch(made: [URL], playlist: URL?, system: GameSystem?) {
+        guard retroArchPlaylists, !made.isEmpty else { return }
+        guard let system else { append("  not added to a RetroArch playlist: couldn't tell which system it's for"); return }
+        do {
+            let file = try RetroArch.add(RetroArch.entries(made: made, playlist: playlist), system: system, folder: retroArchPlaylistFolder)
+            append("  added to RetroArch's “\(file.deletingPathExtension().lastPathComponent)” playlist")
+        } catch {
+            append("  couldn't update the RetroArch playlist: \(error.localizedDescription)")
+        }
+    }
+
+    /// A folder (an SD card, a Steam Deck share…) finished games are also copied to. Nil: off.
+    @Published var copyDestination: URL? {
+        didSet { UserDefaults.standard.set(copyDestination?.path, forKey: "copyDestination") }
+    }
+
+    /// Make: CSO / ZSO: which of the two.
+    @Published var csoFormat: CSOFormat {
+        didSet { UserDefaults.standard.set(csoFormat.rawValue, forKey: "csoFormat") }
+    }
+
+    /// Save each game in a folder named for its console ("PlayStation/…" or "psx/…").
+    @Published var organizeBySystem: Bool {
+        didSet { UserDefaults.standard.set(organizeBySystem, forKey: "organizeBySystem") }
+    }
+    /// Readable folder names ("PlayStation") or the ones ES-DE, Batocera and RetroBat use ("psx").
+    @Published var systemFolderStyle: SystemFolderStyle {
+        didSet { UserDefaults.standard.set(systemFolderStyle.rawValue, forKey: "systemFolderStyle") }
+    }
+    func systemFolderName(_ s: GameSystem) -> String { systemFolderStyle == .esde ? s.esde : s.folder }
+
+    /// The console a game is for: its Redump match's system, or what the disc itself shows.
+    func system(of disc: URL, redump: RedumpResult?) -> GameSystem? {
+        Converter.system(of: disc, redump: redump, index: RedumpDB.shared.index)
+    }
+    nonisolated static func system(of disc: URL, redump: RedumpResult?, index: RedumpIndex) -> GameSystem? {
+        switch redump {
+        case .match(let game), .partial(let game, _, _):
+            if let id = index.system[game], let s = Systems.byID(id) { return s }
+        default: break
+        }
+        return Systems.detect(disc)
+    }
+
     @Published var isoMode: ISOMode {
         didSet { UserDefaults.standard.set(isoMode.rawValue, forKey: "isoMode") }
     }
@@ -84,6 +138,12 @@ final class Converter: ObservableObject {
         makeM3U = d.object(forKey: "makeM3U") as? Bool ?? true
         verify = d.bool(forKey: "verify")
         isoMode = ISOMode(rawValue: d.string(forKey: "isoMode") ?? "") ?? .automatic
+        organizeBySystem = d.bool(forKey: "organizeBySystem")
+        csoFormat = CSOFormat(rawValue: d.string(forKey: "csoFormat") ?? "") ?? .automatic
+        retroArchPlaylists = d.bool(forKey: "retroArchPlaylists")
+        retroArchFolder = d.string(forKey: "retroArchFolder").map { URL(fileURLWithPath: $0, isDirectory: true) }
+        copyDestination = d.string(forKey: "copyDestination").map { URL(fileURLWithPath: $0, isDirectory: true) }
+        systemFolderStyle = SystemFolderStyle(rawValue: d.string(forKey: "systemFolderStyle") ?? "") ?? .readable
         startFromFinder = d.object(forKey: "startFromFinder") as? Bool ?? true
         outputFormat = OutputFormat(rawValue: d.string(forKey: "outputFormat") ?? "") ?? .chd
         pbpFolders = d.bool(forKey: "pbpFolders")
@@ -173,7 +233,7 @@ final class Converter: ObservableObject {
                 let e = fm.enumerator(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
                 while let f = e?.nextObject() as? URL {
                     let ext = f.pathExtension.lowercased()
-                    if Converter.inputExtensions.contains(ext) || (ext == "chd" && outputFormat == .pbp) {
+                    if Converter.inputExtensions.contains(ext) || (ext == "chd" && outputFormat != .chd) {
                         found.append(f)   // (CHDs too when making PBPs: they're the games then)
                     } else if Converter.archiveExtensions.contains(ext), !Converter.isLaterPart(f), archiveHasDiscImage(f) {
                         found.append(f)   // only archives with a disc image inside, not zipped cartridge games
@@ -552,6 +612,7 @@ final class Converter: ObservableObject {
             while !cancelRequested && !pauseRequested, let i = jobs.firstIndex(where: { $0.state == .queued }) {
                 last = jobs[i].id
                 if outputFormat == .pbp { await makePBP(index: i) }
+                else if outputFormat == .cso { await makeCSO(index: i) }
                 else if jobs[i].isExtraction { await extract(index: i) } else { await convert(index: i) }
             }
             isRunning = false
@@ -595,6 +656,8 @@ final class Converter: ObservableObject {
     /// What compressGame produced for one game (one .pbp/.cue/.gdi/.iso).
     private struct GameResult {
         var made: [URL] = []
+        var playlist: URL?               // the .m3u written for a multi-disc game
+        var system: GameSystem?          // which console it's for, when known
         var skipped = 0                 // CHDs that already existed and weren't rewritten
         var bytesIn = 0.0, bytesOut = 0.0
         var redump: [RedumpResult] = []  // one per game checked against Redump
@@ -684,6 +747,7 @@ final class Converter: ObservableObject {
         }
 
         var total = GameResult()
+        var perGame: [(made: [URL], playlist: URL?, system: GameSystem?)] = []
         for (i, game) in games.enumerated() {
             let w = (span.end - span.start) / Double(games.count)
             let start = span.start + w * Double(i)
@@ -696,6 +760,7 @@ final class Converter: ObservableObject {
             total.bytesIn += r.bytesIn; total.bytesOut += r.bytesOut
             total.redump += r.redump
             total.patchedWith = total.patchedWith ?? r.patchedWith
+            perGame.append((r.made, r.playlist, r.system))
         }
         // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
         // (Likewise a patched CHD is compared with the CHD it came from.)
@@ -714,6 +779,10 @@ final class Converter: ObservableObject {
         if verify { summary += " · verified" }
         let unmatched = total.redump.first { !$0.isMatch }
         if !total.redump.isEmpty { summary += " · " + (unmatched?.short ?? "✓ Redump") }
+
+        // Optional: RetroArch playlists, and a copy on a device.
+        for g in perGame { addToRetroArch(made: g.made, playlist: g.playlist, system: g.system) }
+        if let note = await copyToDevice(made + perGame.compactMap(\.playlist), id: id) { summary += " · " + note }
 
         // Optional: move the originals to the Trash, only when every CHD was freshly and fully written.
         if trashSources {
@@ -796,6 +865,20 @@ final class Converter: ObservableObject {
         if patch == nil, case .match(let game) = redump, RedumpDB.shared.renameToRedump {
             let named = Converter.safeFileName(game)
             if named != base { append("  naming it after Redump: \(named).chd"); chdBase = named }
+        }
+
+        // Which console it's for (from the Redump match, or the disc itself), and optionally a folder for it.
+        let system = self.system(of: src, redump: redump)
+        var outDir = outDir
+        if organizeBySystem {
+            if let system {
+                outDir = outDir.appendingPathComponent(systemFolderName(system), isDirectory: true)
+                do { try fm.createDirectory(at: outDir, withIntermediateDirectories: true) }
+                catch { fail("Can't create the \(outDir.lastPathComponent) folder: \(error.localizedDescription)"); return nil }
+                append("  \(system.folder) game: saving it in \(outDir.lastPathComponent)/")
+            } else {
+                append("  couldn't tell which system this is for, so it's saved without a system folder")
+            }
         }
 
         // PBP extraction counts as the first 20% of the game, compression the rest.
@@ -980,12 +1063,13 @@ final class Converter: ObservableObject {
 
         if let redump { result.redump = [redump] }
         result.patchedWith = applied?.lastPathComponent
+        result.system = system
 
         // Multi-disc playlist (named like the CHDs: a patched set gets the patched name)
         if result.made.count > 1 && makeM3U {
             let m3u = outDir.appendingPathComponent((applied != nil ? chdBase : base) + ".m3u")
             let body = result.made.map { $0.lastPathComponent }.joined(separator: "\n") + "\n"
-            do { try body.write(to: m3u, atomically: true, encoding: .utf8); append("  wrote \(m3u.lastPathComponent)") }
+            do { try body.write(to: m3u, atomically: true, encoding: .utf8); append("  wrote \(m3u.lastPathComponent)"); result.playlist = m3u }
             catch { append("  couldn't write \(m3u.lastPathComponent): \(error.localizedDescription)") }
         }
         return result

@@ -21,13 +21,16 @@ enum Diagnostics {
         lines.append("")
         lines.append("Tools")
         for (label, name) in [("chdman", "chdman"), ("7-Zip", "7zz"), ("xdelta3", "xdelta3"),
-                              ("dolphin-tool", "dolphin-tool"), ("PSXPackager", "psxpackager")] {
+                              ("dolphin-tool", "dolphin-tool"), ("PSXPackager", "psxpackager"), ("maxcso", "maxcso")] {
             lines.append("  \(label): \(describeTool(name))")
         }
 
         lines.append("")
         lines.append("Settings")
-        lines.append("  Make: \(c.outputFormat.label)" + (c.outputFormat == .pbp ? " (EBOOT.PBP folders: \(on(c.pbpFolders)))" : ""))
+        lines.append("  Make: \(c.outputFormat.label)" + (c.outputFormat == .pbp ? " (EBOOT.PBP folders: \(on(c.pbpFolders)))" : "")
+                     + (c.outputFormat == .cso ? " (\(c.csoFormat.label))" : ""))
+        lines.append("  Sort into a folder per system: \(on(c.organizeBySystem)) (\(c.systemFolderStyle.label)); RetroArch playlists: \(on(c.retroArchPlaylists)); "
+                     + "copy finished games: \(c.copyDestination == nil ? "off" : "on"); watch folder: \(WatchFolder.shared.isWatching ? "on" : "off")")
         lines.append("  Save to: \(c.outputDir == nil ? "same folder as each source file" : "a chosen folder")")
         lines.append("  ISO images: \(c.isoMode.label); verify: \(on(c.verify)); overwrite: \(on(c.overwrite)); "
                      + ".m3u playlists: \(on(c.makeM3U)); move sources to Trash: \(on(c.trashSources))")

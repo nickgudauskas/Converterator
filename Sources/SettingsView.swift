@@ -11,12 +11,47 @@ struct SettingsView: View {
     @ObservedObject private var c = Converter.shared
     @ObservedObject private var redump = RedumpDB.shared
     @ObservedObject private var patches = PatchLibrary.shared
+    @ObservedObject private var watch = WatchFolder.shared
 
     var body: some View {
         Form {
             Section("Finder") {
                 Toggle("Start converting right away", isOn: $c.startFromFinder)
                 Text("For files sent with Convert with Converterator in Finder's right-click menu (under Quick Actions or Services). Turned off, they're just added to the list.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Watch folder") {
+                HStack {
+                    Text("Folder:")
+                    Text(watch.folder?.path(percentEncoded: false) ?? "None")
+                        .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                    Spacer()
+                    Button("Choose…", action: chooseWatchFolder)
+                    if watch.folder != nil { Button("Clear") { watch.folder = nil } }
+                }
+                Toggle("Watch it for new games", isOn: $watch.enabled).disabled(watch.folder == nil)
+                Toggle("Start converting as soon as one arrives", isOn: $watch.autoStart).disabled(watch.folder == nil || !watch.enabled)
+                Text("While Converterator is open, disc images, archives and ECM files that land in this folder (or one level of folders inside it) are added to the list once they've finished downloading. Patches go into the patches box. Files already there when watching starts are left alone.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Folders per system") {
+                Picker("Folder names:", selection: $c.systemFolderStyle) {
+                    ForEach(SystemFolderStyle.allCases) { Text($0.label).tag($0) }
+                }
+                Text("With “Sort into a folder per system” on in the main window, each game is saved in a folder for its console. The console comes from the game's Redump match, or from the disc itself (PlayStation, PS2, PSP, Saturn, Sega CD, Dreamcast, PC Engine CD, PC-FX, 3DO, Neo Geo CD, CD-i, CD32, GameCube, Wii and Xbox can be told apart).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("RetroArch") {
+                Toggle("Add converted games to RetroArch playlists", isOn: $c.retroArchPlaylists)
+                HStack {
+                    Text("Playlists folder:")
+                    Text(c.retroArchPlaylistFolder.path(percentEncoded: false))
+                        .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                    Spacer()
+                    Button("Choose…", action: chooseRetroArchFolder)
+                    if c.retroArchFolder != nil { Button("Default") { c.retroArchFolder = nil } }
+                }
+                Text("Each game goes into the playlist for its system (for example “Sony - PlayStation”), so it shows up in RetroArch without a scan, with thumbnails when it has its Redump name. A multi-disc game goes in through its .m3u. File → Library Report… can add games you converted before.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Patches") {
@@ -91,6 +126,25 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 560)
         .frame(minHeight: 520)
+    }
+
+    private func chooseWatchFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.prompt = "Watch"
+        panel.message = "Choose a folder to watch for new games, such as Downloads"
+        if panel.runModal() == .OK, let url = panel.url { watch.folder = url; watch.enabled = true }
+    }
+
+    private func chooseRetroArchFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL = c.retroArchPlaylistFolder
+        panel.message = "Choose RetroArch's playlists folder (in RetroArch: Settings → Directory → Playlists)"
+        if panel.runModal() == .OK, let url = panel.url { c.retroArchFolder = url }
     }
 
     private func choosePatchesFolder() {

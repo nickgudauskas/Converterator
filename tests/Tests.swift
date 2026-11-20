@@ -711,6 +711,173 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         c.outputFormat = .chd
         c.clearAll()
 
+        // MARK: Systems
+        section("Telling systems apart")
+        /// A raw CD image whose first data sector starts with `header` (Mode 1, 2352-byte sectors), with its .cue.
+        func rawDisc(_ dir: URL, _ name: String, header: [UInt8], mode2048: Bool = false) -> URL {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            var d = Data()
+            for n in 0..<40 {
+                var s = [UInt8](repeating: 0, count: mode2048 ? 2048 : 2352)
+                let o = mode2048 ? 0 : 16
+                if !mode2048 { s[1...10] = ArraySlice(repeating: 0xFF, count: 10); s[15] = 1 }
+                if n == 0 { for (k, b) in header.enumerated() { s[o + k] = b } }
+                d += Data(s)
+            }
+            try! d.write(to: dir.appendingPathComponent(name + ".bin"))
+            let cue = dir.appendingPathComponent(name + ".cue")
+            try! "FILE \"\(name).bin\" BINARY\n  TRACK 01 \(mode2048 ? "MODE1/2048" : "MODE1/2352")\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8)
+            return cue
+        }
+        let sysDir = W.appendingPathComponent("systems")
+        let saturn = rawDisc(sysDir, "Saturn Game", header: Array("SEGA SEGASATURN ".utf8))
+        let segacd = rawDisc(sysDir, "Sega CD Game", header: Array("SEGADISCSYSTEM  ".utf8))
+        let threeDO = rawDisc(sysDir, "3DO Game", header: [0x01, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x01], mode2048: true)
+        let wiiRVZ = Data([0x52, 0x56, 0x5A, 0x01]) + Data(count: 0x44) + Data([0, 0, 0, 2]) + Data(count: 64)
+        try! wiiRVZ.write(to: sysDir.appendingPathComponent("Wii Game.rvz"))
+        for (file, want) in [(F.appendingPathComponent("psp.iso"), "PSP"), (F.appendingPathComponent("ps2.iso"), "PlayStation 2"),
+                             (F.appendingPathComponent("ps1.iso"), "PlayStation"), (F.appendingPathComponent("ps1/PS1 Game (Disc 1).cue"), "PlayStation"),
+                             (F.appendingPathComponent("gc/GC Game (USA).iso"), "GameCube"), (sysDir.appendingPathComponent("Wii Game.rvz"), "Wii"),
+                             (saturn, "Saturn"), (segacd, "Sega CD"), (threeDO, "3DO"), (F.appendingPathComponent("plain.iso"), "unknown")] {
+            check((Systems.detect(file)?.folder ?? "unknown") == want, "\(file.lastPathComponent) → \(want)", Systems.detect(file)?.folder ?? "unknown")
+        }
+        var sysIndex = RedumpIndex(); sysIndex.system["Some Game (Japan)"] = "ss"
+        check(Converter.system(of: F.appendingPathComponent("plain.iso"), redump: .match("Some Game (Japan)"), index: sysIndex)?.folder == "Saturn",
+              "a Redump match's system comes first")
+        check(Systems.fromFolderName("psx")?.id == "psx" && Systems.fromFolderName("PS1")?.id == "psx"
+              && Systems.fromFolderName("Sony - PlayStation 2")?.id == "ps2" && Systems.fromFolderName("Games") == nil, "systems from folder names")
+
+        // MARK: Folders per system, RetroArch playlists, copying to a device
+        section("Folders per system, RetroArch playlists and copying")
+        let org = workspace("organize", from: F, ["ps1/PS1 Game (Disc 1).cue", "ps1/PS1 Game (Disc 1).bin", "ps2.iso"], into: W)
+        let ra = W.appendingPathComponent("retroarch"), device = W.appendingPathComponent("device")
+        try? fm.createDirectory(at: ra, withIntermediateDirectories: true); try? fm.createDirectory(at: device, withIntermediateDirectories: true)
+        // A playlist RetroArch already has, with a game and a setting of its own, must be kept.
+        try! #"{"version":"1.5","default_core_name":"Beetle PSX","items":[{"path":"/Games/Other.chd","label":"Other Game"}]}"#
+            .write(to: ra.appendingPathComponent("Sony - PlayStation.lpl"), atomically: true, encoding: .utf8)
+        c.organizeBySystem = true; c.systemFolderStyle = .readable
+        c.retroArchPlaylists = true; c.retroArchFolder = ra; c.copyDestination = device
+        jobs = await runBatch([org.appendingPathComponent("PS1 Game (Disc 1).cue"), org.appendingPathComponent("ps2.iso")])
+        let ps1CHD = org.appendingPathComponent("PlayStation/PS1 Game (Disc 1).chd"), ps2CHD = org.appendingPathComponent("PlayStation 2/ps2.chd")
+        check(exists(ps1CHD) && exists(ps2CHD), "CHDs saved in PlayStation/ and PlayStation 2/", job(jobs, "ps2.iso")?.detail ?? "")
+        let lpl = (try? JSONSerialization.jsonObject(with: Data(contentsOf: ra.appendingPathComponent("Sony - PlayStation.lpl")))) as? [String: Any]
+        let items = lpl?["items"] as? [[String: Any]] ?? []
+        check(items.contains { $0["path"] as? String == ps1CHD.standardizedFileURL.path && $0["label"] as? String == "PS1 Game (Disc 1)" && $0["db_name"] as? String == "Sony - PlayStation.lpl" },
+              "added to RetroArch's “Sony - PlayStation” playlist", "\(items)")
+        check(items.contains { $0["path"] as? String == "/Games/Other.chd" } && lpl?["default_core_name"] as? String == "Beetle PSX",
+              "the playlist's other games and settings are kept")
+        check(exists(ra.appendingPathComponent("Sony - PlayStation 2.lpl")), "a PS2 game goes in the PS2 playlist")
+        check(totalSize([device.appendingPathComponent("PlayStation/PS1 Game (Disc 1).chd")]) == totalSize([ps1CHD])
+              && exists(device.appendingPathComponent("PlayStation 2/ps2.chd")), "copied to the device, in the same system folders")
+        check(job(jobs, "ps2.iso")?.detail.contains("copied to") == true, "the list says it was copied", job(jobs, "ps2.iso")?.detail ?? "")
+        check(Cleanup.scanSources(in: org, outputDir: nil, sevenZip: nil).converted.count == 2, "Clean Up Originals finds CHDs in system folders")
+        jobs = await runBatch([org.appendingPathComponent("ps2.iso")])
+        check(job(jobs, "ps2.iso")?.detail.contains("already on") == true, "a game already on the device isn't copied again", job(jobs, "ps2.iso")?.detail ?? "")
+        c.copyDestination = W.appendingPathComponent("unplugged-card"); c.overwrite = true
+        jobs = await runBatch([org.appendingPathComponent("ps2.iso")])
+        check(job(jobs, "ps2.iso")?.state == .done && job(jobs, "ps2.iso")?.detail.contains("isn't connected") == true,
+              "a device that isn't connected: converted, not copied", job(jobs, "ps2.iso")?.detail ?? "")
+        c.copyDestination = device; try? fm.removeItem(at: device.appendingPathComponent("PlayStation 2"))
+        DiskSpace.override = { url in url.path.hasPrefix(device.path) ? 1_000 : nil }
+        jobs = await runBatch([org.appendingPathComponent("ps2.iso")])
+        check(job(jobs, "ps2.iso")?.detail.contains("not enough space") == true && !exists(device.appendingPathComponent("PlayStation 2/ps2.chd")),
+              "not enough space on the device: not copied", job(jobs, "ps2.iso")?.detail ?? "")
+        DiskSpace.override = nil; c.overwrite = false
+        c.systemFolderStyle = .esde
+        let orgE = workspace("organize-esde", from: F, ["ps2.iso"], into: W)
+        jobs = await runBatch([orgE.appendingPathComponent("ps2.iso")])
+        check(exists(orgE.appendingPathComponent("ps2/ps2.chd")), "ES-DE style folder names (ps2/)")
+        c.organizeBySystem = false; c.systemFolderStyle = .readable; c.retroArchPlaylists = false; c.retroArchFolder = nil; c.copyDestination = nil
+        // A whole library into RetroArch: system from the folder name, discs through their .m3u
+        let ralib = W.appendingPathComponent("ra-library")
+        for d in ["PlayStation", "Unsorted"] { try? fm.createDirectory(at: ralib.appendingPathComponent(d), withIntermediateDirectories: true) }
+        fakeCHD(ralib.appendingPathComponent("PlayStation/Solo (USA).chd"), data: 11)
+        fakeCHD(ralib.appendingPathComponent("PlayStation/Two (Disc 1).chd"), data: 12)
+        fakeCHD(ralib.appendingPathComponent("PlayStation/Two (Disc 2).chd"), data: 13)
+        try! "Two (Disc 1).chd\nTwo (Disc 2).chd\n".write(to: ralib.appendingPathComponent("PlayStation/Two.m3u"), atomically: true, encoding: .utf8)
+        fakeCHD(ralib.appendingPathComponent("Unsorted/Mystery.chd"), data: 14)
+        let (bySystem, unknownGames) = RetroArch.library(ralib, index: db.index, checked: [:])
+        let psx = (bySystem.first { $0.key.id == "psx" }?.value ?? []).map(\.label).sorted()
+        check(psx == ["Solo (USA)", "Two"] && unknownGames.map(\.lastPathComponent) == ["Mystery.chd"],
+              "library: system from the folder, a multi-disc game through its .m3u, unknown ones left out", "\(psx) / \(unknownGames)")
+
+        // MARK: Extra copies
+        section("Extra copies")
+        let ex = W.appendingPathComponent("extra"); try? fm.createDirectory(at: ex.appendingPathComponent("PlayStation"), withIntermediateDirectories: true)
+        fakeCHD(ex.appendingPathComponent("game copy 2.chd"), data: 21); fakeCHD(ex.appendingPathComponent("gm.chd"), data: 21)
+        check(LibraryReport.keeper(of: [ex.appendingPathComponent("game copy 2.chd"), ex.appendingPathComponent("gm.chd")],
+                                   redumpNames: [], checked: [:], datStamp: "").lastPathComponent == "gm.chd", "otherwise the shortest name stays")
+        fakeCHD(ex.appendingPathComponent("Real Game (USA).chd"), data: 21)
+        check(LibraryReport.keeper(of: [ex.appendingPathComponent("gm.chd"), ex.appendingPathComponent("Real Game (USA).chd")],
+                                   redumpNames: ["Real Game (USA)"], checked: [:], datStamp: "").lastPathComponent == "Real Game (USA).chd",
+              "the copy named as in Redump stays")
+        fakeCHD(ex.appendingPathComponent("PlayStation/x.chd"), data: 21)
+        check(LibraryReport.keeper(of: [ex.appendingPathComponent("gm.chd"), ex.appendingPathComponent("PlayStation/x.chd")],
+                                   redumpNames: [], checked: [:], datStamp: "").path.hasSuffix("PlayStation/x.chd"), "one in a folder per system beats a shorter name")
+        try! "game copy 2.chd\n".write(to: ex.appendingPathComponent("set.m3u"), atomically: true, encoding: .utf8)
+        check(LibraryReport.keeper(of: [ex.appendingPathComponent("Real Game (USA).chd"), ex.appendingPathComponent("game copy 2.chd")],
+                                   redumpNames: ["Real Game (USA)"], checked: [:], datStamp: "").lastPathComponent == "game copy 2.chd",
+              "the copy a playlist lists stays, whatever its name")
+
+        // MARK: Watch folder
+        section("Watch folder")
+        let wf = WatchFolder.shared, watched = W.appendingPathComponent("watched")
+        try? fm.createDirectory(at: watched.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try! fm.copyItem(at: F.appendingPathComponent("plain.iso"), to: watched.appendingPathComponent("old.iso"))
+        c.clearAll(); c.clearAddedPatches()
+        wf.interval = 3600; wf.settle = 0; wf.autoStart = false
+        wf.folder = watched; wf.enabled = true
+        check(wf.isWatching, "watching")
+        try! fm.copyItem(at: F.appendingPathComponent("ps1.iso"), to: watched.appendingPathComponent("sub/new.iso"))
+        try! fm.copyItem(at: F.appendingPathComponent("patch/Base (English).xdelta"), to: watched.appendingPathComponent("Base (English).xdelta"))
+        try! "FILE \"half.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n".write(to: watched.appendingPathComponent("half.cue"), atomically: true, encoding: .utf8)
+        wf.look()
+        check(c.jobs.isEmpty, "a new file isn't added until it's stopped changing")
+        wf.look()
+        check(c.jobs.map(\.url.lastPathComponent) == ["new.iso"], "a new game (in a subfolder) is added; one already there isn't", "\(c.jobs.map(\.url.lastPathComponent))")
+        check(c.addedPatches.map(\.lastPathComponent) == ["Base (English).xdelta"], "a new patch goes into the patches box")
+        try! fm.copyItem(at: F.appendingPathComponent("cd/game.bin"), to: watched.appendingPathComponent("half.bin"))
+        wf.look(); wf.look()
+        check(c.jobs.contains { $0.url.lastPathComponent == "half.cue" } && c.jobs.first { $0.url.lastPathComponent == "half.cue" }?.state == .queued,
+              "a .cue waits for its .bin to arrive")
+        wf.enabled = false
+        check(!wf.isWatching, "stops watching when turned off")
+        c.clearAll(); c.clearAddedPatches(); wf.folder = nil
+
+        // MARK: CSO / ZSO
+        section("CSO and ZSO (maxcso)")
+        check(Converter.findTool("maxcso") != nil, "maxcso found")
+        c.outputFormat = .cso; c.verify = true
+        let cso = workspace("cso", from: F, ["psp.iso", "ps2.iso", "cd/game.cue", "cd/game.bin"], into: W)
+        let csoCHD = workspace("cso-chd", from: F, ["chd/ps2.chd"], into: W)
+        c.clearAll(); c.add([cso])
+        check(Set(c.jobs.map(\.url.lastPathComponent)) == ["psp.iso", "ps2.iso", "game.cue"], "making CSO/ZSO, a folder scan picks up the games")
+        jobs = await runBatch([cso.appendingPathComponent("psp.iso"), cso.appendingPathComponent("ps2.iso"), cso.appendingPathComponent("game.cue"),
+                               csoCHD.appendingPathComponent("ps2.chd")])
+        func unpacked(_ f: URL) -> String? {
+            let out = W.appendingPathComponent("cso-check-\(UUID().uuidString).iso")
+            defer { try? fm.removeItem(at: out) }
+            let p = Process(); p.executableURL = Converter.findTool("maxcso"); p.arguments = ["--decompress", f.path, "-o", out.path]
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try? p.run(); p.waitUntilExit()
+            return sha1(out)
+        }
+        check(job(jobs, "psp.iso")?.state == .done && unpacked(cso.appendingPathComponent("psp.cso")) == sha1(F.appendingPathComponent("psp.iso")),
+              "a PSP ISO becomes a CSO holding the same ISO", job(jobs, "psp.iso")?.detail ?? "")
+        check(job(jobs, "ps2.iso")?.state == .done && unpacked(cso.appendingPathComponent("ps2.zso")) == sha1(F.appendingPathComponent("ps2.iso"))
+              && job(jobs, "ps2.iso")?.detail.contains("verified") == true, "a PS2 ISO becomes a ZSO (for OPL), verified", job(jobs, "ps2.iso")?.detail ?? "")
+        check(job(jobs, "ps2.chd")?.state == .done && unpacked(csoCHD.appendingPathComponent("ps2.zso")) == sha1(F.appendingPathComponent("ps2.iso")),
+              "a DVD CHD is unpacked and becomes a ZSO", job(jobs, "ps2.chd")?.detail ?? "")
+        check(job(jobs, "game.cue")?.state == .failed && job(jobs, "game.cue")?.detail.contains("CD image") == true,
+              "a CD image (BIN/CUE) is refused with a reason", job(jobs, "game.cue")?.detail ?? "")
+        c.csoFormat = .cso
+        let cso2 = workspace("cso-always", from: F, ["ps2.iso"], into: W)
+        jobs = await runBatch([cso2.appendingPathComponent("ps2.iso")])
+        check(exists(cso2.appendingPathComponent("ps2.cso")), "“Always CSO” makes a CSO even for a PS2 game")
+        c.csoFormat = .automatic; c.outputFormat = .chd; c.verify = false
+        c.clearAll()
+
+
         // MARK: Pause and the saved queue
         section("Pause, Resume and the saved queue")
         let pz = W.appendingPathComponent("pause"); try? fm.createDirectory(at: pz, withIntermediateDirectories: true)

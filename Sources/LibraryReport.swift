@@ -160,6 +160,34 @@ struct LibraryReport: Sendable {
         return sha.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Which copy of an identical set to keep: one a playlist (.m3u) next to it lists, then one named exactly as
+    /// in Redump, then one remembered as matching Redump, then one in a folder per system; otherwise the one with
+    /// the shortest name. The rest can go.
+    nonisolated static func keeper(of files: [URL], redumpNames: Set<String>, checked: [String: RedumpCache.Entry],
+                                   datStamp: String) -> URL {
+        func score(_ f: URL) -> Int {
+            var s = 0
+            let dir = f.deletingLastPathComponent()
+            let m3us = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension.lowercased() == "m3u" }
+            if m3us.contains(where: { m in
+                ((try? String(contentsOf: m, encoding: .utf8)) ?? "").components(separatedBy: .newlines)
+                    .contains { $0.trimmingCharacters(in: .whitespaces) == f.lastPathComponent }
+            }) { s += 8 }
+            let base = f.deletingPathExtension().lastPathComponent
+            if redumpNames.contains(where: { Converter.safeFileName($0) == base }) { s += 4 }
+            if RedumpCache.result(for: f, in: checked, datStamp: datStamp)?.isMatch == true { s += 2 }
+            if Systems.folderNames.contains(f.deletingLastPathComponent().lastPathComponent) { s += 1 }
+            return s
+        }
+        return files.max { a, b in
+            let (sa, sb) = (score(a), score(b))
+            if sa != sb { return sa < sb }
+            if a.lastPathComponent.count != b.lastPathComponent.count { return a.lastPathComponent.count > b.lastPathComponent.count }
+            return a.path.localizedStandardCompare(b.path) == .orderedDescending
+        } ?? files[0]
+    }
+
     /// A game's title without its tags and disc number: "Racing Lagoon (Japan, Asia) (Disc 1)" → "Racing Lagoon".
     nonisolated static func plainTitle(_ name: String) -> String {
         var t = DiscName.parse(name)?.key ?? name
@@ -336,6 +364,53 @@ final class Library: ObservableObject {
 
     func rescan() { if let folder { scan(folder) } }
 
+    /// The copies Move Extra Copies to Trash would remove (all but one of each identical set).
+    func extraCopies() -> [URL] {
+        guard let report else { return [] }
+        let names = Set(RedumpDB.shared.index.trackCount.keys), checked = RedumpCache.all(), stamp = RedumpDB.shared.index.stamp
+        return report.identical.flatMap { g in
+            let keep = LibraryReport.keeper(of: g.files, redumpNames: names, checked: checked, datStamp: stamp)
+            return g.files.filter { $0 != keep }
+        }
+    }
+
+    func moveExtraCopiesToTrash() {
+        let extra = extraCopies()
+        guard !extra.isEmpty else { return }
+        let a = NSAlert()
+        a.messageText = "Move \(extra.count) extra cop\(extra.count == 1 ? "y" : "ies") to the Trash?"
+        a.informativeText = "One copy of each game stays: one a playlist lists, or one named as in Redump, or one in a folder per system, or else the one with the shortest name. This frees \(formatBytes(totalSize(extra))). You can put them back from the Trash.\n\n"
+            + extra.prefix(8).map { "• " + $0.lastPathComponent }.joined(separator: "\n") + (extra.count > 8 ? "\n…and \(extra.count - 8) more" : "")
+        a.addButton(withTitle: "Move to Trash")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        var moved = 0, failed: [String] = []
+        for f in extra {
+            do { try FileManager.default.trashItem(at: f, resultingItemURL: nil); moved += 1 }
+            catch { failed.append(f.lastPathComponent) }
+        }
+        message = "Moved \(moved) extra cop\(moved == 1 ? "y" : "ies") to the Trash." + (failed.isEmpty ? "" : " Couldn't move: \(failed.joined(separator: ", ")).")
+        rescan()
+    }
+
+    /// Adds every game in the folder to RetroArch's playlists, by system.
+    func addToRetroArch() {
+        guard let folder else { return }
+        let c = Converter.shared
+        let (bySystem, unknown) = RetroArch.library(folder, index: RedumpDB.shared.index, checked: RedumpCache.all())
+        var added = 0, errors: [String] = []
+        for (system, entries) in bySystem {
+            do { try RetroArch.add(entries, system: system, folder: c.retroArchPlaylistFolder); added += entries.count }
+            catch { errors.append(error.localizedDescription) }
+        }
+        var parts = ["Added \(added) game\(added == 1 ? "" : "s") to \(bySystem.count) RetroArch playlist\(bySystem.count == 1 ? "" : "s")."]
+        if !unknown.isEmpty {
+            parts.append("\(unknown.count) couldn't be placed: their system isn't known. Put them in a folder named for the system (like “PlayStation”), or check them against Redump first.")
+        }
+        parts += errors
+        message = parts.joined(separator: " ")
+    }
+
     func makePlaylists() {
         guard let report else { return }
         var written = 0
@@ -397,7 +472,9 @@ struct LibraryView: View {
                 if !redump.index.isEmpty {
                     row("Named as in Redump", "\(r.redumpNamed) of \(r.chds.count)")
                 }
-            } header: { Text("Summary") }
+            } header: {
+                header("Summary", nil, action: r.chds.isEmpty ? nil : ("Add to RetroArch Playlists", { m.addToRetroArch() }))
+            }
 
             Section {
                 if r.unconverted.isEmpty { Text("Everything here is converted.").foregroundStyle(.secondary) }
@@ -449,7 +526,8 @@ struct LibraryView: View {
                 }
                 more(r.identical.count)
             } header: {
-                header("Identical copies: \(r.identical.count)", r.identical.isEmpty ? nil : "could free \(formatBytes(r.identicalBytes))", action: nil)
+                header("Identical copies: \(r.identical.count)", r.identical.isEmpty ? nil : "could free \(formatBytes(r.identicalBytes))",
+                       action: r.identical.isEmpty ? nil : ("Move Extra Copies to Trash…", { m.moveExtraCopiesToTrash() }))
             }
 
             Section {

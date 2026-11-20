@@ -198,7 +198,10 @@ final class Cleanup: ObservableObject {
 
     /// The CHDs for one game: `base.chd`, or for a multi-disc PBP the CHDs its `base.m3u` lists.
     /// Nil unless they all exist and aren't empty.
-    nonisolated static func covering(base: String, isPBP: Bool, in dirs: [URL]) -> [URL]? {
+    nonisolated static func covering(base: String, isPBP: Bool, in folders: [URL]) -> [URL]? {
+        // (Also in a folder per system inside each, when games are sorted that way.)
+        let dirs = folders.flatMap { d in [d] + Systems.folderNames.map { d.appendingPathComponent($0, isDirectory: true) } }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
         for dir in dirs {
             // (A GameCube/Wii disc's is an .rvz.)
             for ext in ["chd", "rvz"] {

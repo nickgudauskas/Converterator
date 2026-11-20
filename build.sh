@@ -18,6 +18,9 @@ DOLPHIN_SHA256="04336ad3421256f1019ff1831d3274460782f22c20b828daa5b904455aa26ef0
 XDELTA_VERSION="3.2.2"
 XDELTA_SHA256_ARM64="27dcf763beb075ed28061ef136613f4bc6ea3999cb424f23a7d59f18ca2d7c8b"
 XDELTA_SHA256_X86_64="e217f4d0f92357ee890f9d8b5571f7eb836a86ff87e8834bed0b9d9b38630f86"
+# maxcso, for CSO and ZSO (PSP and PS2 hardware), built from its source by .github/workflows/maxcso.yml.
+MAXCSO_VERSION="1.13.0"
+MAXCSO_SHA256="f85872029cffa5db20ab1595887949d5aa7f53e513daca81c5c188707b27a63c"
 # 7-Zip (7zz), for .7z and .rar archives: the official macOS builds by Igor Pavlov (LGPL, unRAR restriction).
 SEVENZIP_VERSION="26.06"
 SEVENZIP_SHA256_ARM64="b6f17920b4240940461dac8ef4009891881ac44d2a5ead625ede2ec8472185dd"
@@ -110,6 +113,18 @@ if [[ ! -x "$DT/dolphin-tool" ]]; then
   rm -rf "$DT"; ditto -x -k "$DT.zip" "$DT"; rm -f "$DT.zip"
 fi
 
+# maxcso: download the universal build once into vendor/, and check it's exactly the one published.
+MC="vendor/maxcso-$MAXCSO_VERSION"
+if [[ ! -x "$MC/maxcso" ]]; then
+  echo "Downloading maxcso $MAXCSO_VERSION…"
+  mkdir -p vendor
+  curl -fsSL -o "$MC.zip" "https://github.com/thepoisonninja/Converterator/releases/download/maxcso-$MAXCSO_VERSION/maxcso-universal.zip"
+  if [[ "$(shasum -a 256 "$MC.zip" | cut -d' ' -f1)" != "$MAXCSO_SHA256" ]]; then
+    echo "maxcso download doesn't match the expected SHA-256"; rm -f "$MC.zip"; exit 1
+  fi
+  rm -rf "$MC"; ditto -x -k "$MC.zip" "$MC"; rm -f "$MC.zip"
+fi
+
 [[ "${1:-}" == "--fetch-only" ]] && { echo "Tools are in vendor/."; exit 0; }
 
 rm -rf "$APP" build
@@ -137,6 +152,7 @@ ditto "vendor/chdman-$CHDMAN_VERSION" "$APP/Contents/Resources/chdman"
 ditto "$XD" "$APP/Contents/Resources/xdelta3"
 ditto "$DT" "$APP/Contents/Resources/dolphin-tool"
 ditto "$SZ" "$APP/Contents/Resources/7zz"
+ditto "$MC" "$APP/Contents/Resources/maxcso"
 
 # App icon: compile the Icon Composer icon (light + dark variants, made by make_icon.swift).
 # actool writes Assets.car (used by macOS for appearance-aware icons) and AppIcon.icns (fallback).
@@ -202,7 +218,7 @@ if [[ -n "${SIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --options runtime \
       --entitlements psxpackager.entitlements --sign "$SIGN_IDENTITY" "$bin"
   done
-  for tool in chdman xdelta3 dolphin-tool 7zz; do
+  for tool in chdman xdelta3 dolphin-tool 7zz maxcso; do
     codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP/Contents/Resources/$tool/$tool"
   done
   codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP"

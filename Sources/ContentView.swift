@@ -18,6 +18,7 @@ extension Notification.Name {
 struct ContentView: View {
     @ObservedObject private var c = Converter.shared
     @ObservedObject private var updater = UpdateChecker.shared
+    @ObservedObject private var watch = WatchFolder.shared
     @State private var dropTargeted = false
     @State private var patchTargeted = false
     @State private var showLog = false
@@ -234,13 +235,16 @@ struct ContentView: View {
                     Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 7) {
                         if c.outputFormat == .pbp {
                             formatRow("PlayStation discs", "BIN/CUE, ISO, ECM, CHD", "PBP")
+                        } else if c.outputFormat == .cso {
+                            formatRow("PSP games", "ISO, CHD", "CSO")
+                            formatRow("PS2 games", "ISO, DVD CHD", "ZSO (for OPL)")
                         } else {
                             formatRow("CD and DVD images", "BIN/CUE, GDI, ISO, ECM", "CHD")
                             formatRow("GameCube and Wii", "ISO, GCM, WBFS, CISO, GCZ, WIA", "RVZ")
                             formatRow("PS1 Classics", "PBP", "CHD")
                         }
                         formatRow("Archives", "ZIP, 7Z, RAR", "unpacked, then converted")
-                        if c.outputFormat != .pbp {
+                        if c.outputFormat == .chd {
                             formatRow("Back again", "CHD, RVZ", "BIN/CUE, GDI or ISO")
                         }
                     }
@@ -329,7 +333,7 @@ struct ContentView: View {
                         if let patch = job.patch, let name = job.patchedName {
                             let first = job.patchMember.map { "\(patch.lastPathComponent) → \(($0 as NSString).lastPathComponent)" } ?? patch.lastPathComponent
                             let what = ([first] + job.morePatches.map(\.lastPathComponent)).joined(separator: ", then ")
-                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : job.morePatches.isEmpty ? "Patch" : "Patches"): \(what) → \(name).\(c.outputFormat == .pbp ? "pbp" : Converter.isNintendoDisc(job.url) ? "rvz" : "chd")",
+                            Label("\(job.patchFromFolder ? "Patch from your patches folder" : job.morePatches.isEmpty ? "Patch" : "Patches"): \(what) → \(name).\(c.outputFormat == .pbp ? "pbp" : c.outputFormat == .cso ? "cso/zso" : Converter.isNintendoDisc(job.url) ? "rvz" : "chd")",
                                   systemImage: "bandage")
                                 .font(.caption).foregroundStyle(Color.accentColor)
                                 .lineLimit(1).truncationMode(.middle)
@@ -387,34 +391,57 @@ struct ContentView: View {
                 Button("Choose…", action: pickOutput)
                 if c.outputDir != nil { Button("Reset") { c.outputDir = nil } }
             }
+            HStack(spacing: 12) {
+                Toggle("Sort into a folder per system", isOn: $c.organizeBySystem)
+                    .disabled(c.outputFormat == .pbp)
+                    .help("Saves each game in a folder named for its console, such as PlayStation/ or Saturn/ (or psx/, saturn/: choose the style in Settings). The console comes from the game's Redump match, or from the disc itself.")
+                Spacer()
+                Text("Copy finished games to:")
+                Text(c.copyDestination.map { DiskSpace.volumeName($0) == $0.lastPathComponent ? $0.lastPathComponent : "\(DiskSpace.volumeName($0)) › \($0.lastPathComponent)" } ?? "Off")
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .help(c.copyDestination?.path(percentEncoded: false) ?? "Copies each finished game to a folder, such as an SD card or a Steam Deck share.")
+                Button(c.copyDestination == nil ? "Choose…" : "Change…", action: pickCopyDestination)
+                if c.copyDestination != nil {
+                    Button { c.copyDestination = nil } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Stop copying")
+                }
+            }
             HStack(spacing: 20) {
                 Picker("Make:", selection: $c.outputFormat) {
                     ForEach(OutputFormat.allCases) { Text($0.label).tag($0) }
                 }
                 .fixedSize()
                 .help("PBP makes PlayStation games for a PSP or PS Vita (PlayStation games only). Discs of one game go into one PBP.")
+                if c.outputFormat == .cso {
+                    Picker("Format:", selection: $c.csoFormat) {
+                        ForEach(CSOFormat.allCases) { Text($0.label).tag($0) }
+                    }
+                    .fixedSize()
+                    .help("A PSP with custom firmware reads CSO; Open PS2 Loader reads ZSO. Made from ISO images (and DVD CHDs, unpacked first).")
+                }
                 if c.outputFormat == .pbp {
                     Toggle("Put each in its own folder as EBOOT.PBP (for a PSP)", isOn: $c.pbpFolders)
                         .help("A PSP finds PlayStation games as PSP/GAME/<folder>/EBOOT.PBP. Copy the folders to PSP/GAME on the memory stick.")
                 }
             }
             HStack(spacing: 20) {
-                Toggle(c.outputFormat == .pbp ? "Overwrite existing PBPs" : "Overwrite existing CHDs", isOn: $c.overwrite)
+                Toggle(c.outputFormat == .pbp ? "Overwrite existing PBPs" : c.outputFormat == .cso ? "Overwrite existing CSOs/ZSOs" : "Overwrite existing CHDs", isOn: $c.overwrite)
                 Toggle("Make .m3u playlist for multi-disc games", isOn: $c.makeM3U)
-                    .disabled(c.outputFormat == .pbp)
+                    .disabled(c.outputFormat != .chd)
             }
             HStack(spacing: 20) {
-                Toggle("Verify CHDs after writing", isOn: $c.verify)
+                Toggle(c.outputFormat == .cso ? "Verify after writing" : "Verify CHDs after writing", isOn: $c.verify)
+                    .disabled(c.outputFormat == .pbp)
                     .help("Checks each CHD's checksums with chdman verify. CHDs that already exist are checked too, so you can re-add a folder to test it.")
                 Picker("ISO images:", selection: $c.isoMode) {
                     ForEach(ISOMode.allCases) { Text($0.label).tag($0) }
                 }
                 .fixedSize()
                 .help("Automatic makes a DVD CHD for PS2 and PSP games and anything bigger than a CD, and a CD CHD otherwise.")
+                .disabled(c.outputFormat != .chd)
             }
-            .disabled(c.outputFormat == .pbp)   // CHD settings
             Toggle("Move source files to Trash after a successful conversion", isOn: $c.trashSources)
-                .disabled(c.outputFormat == .pbp)   // making PBPs never moves the originals
+                .disabled(c.outputFormat != .chd)   // making PBPs, CSOs and ZSOs never moves the originals
                 .help("Moves the .pbp/.cue/.gdi/.iso file and any .bin tracks it lists to the Trash, only after its CHD is written. For a .chd you extract, moves the .chd. Turns off each time the app starts.")
         }
         .disabled(c.isRunning)
@@ -439,6 +466,11 @@ struct ContentView: View {
             Toggle("Show Log", isOn: $showLog).toggleStyle(.button)
             Spacer()
             VStack(alignment: .trailing, spacing: 1) {
+                if watch.isWatching, let f = watch.folder {
+                    Label("Watching “\(f.lastPathComponent)”", systemImage: "eye")
+                        .foregroundStyle(.secondary)
+                        .help("New games that arrive in \(f.path(percentEncoded: false)) are added\(watch.autoStart ? " and converted" : ""). Change this in Settings.")
+                }
                 Text(Self.versionLabel)
                     .foregroundStyle(.tertiary)
                     .textSelection(.enabled)
@@ -516,6 +548,16 @@ struct ContentView: View {
         panel.message = "Choose a patch for \(job.url.lastPathComponent) (IPS, BPS, PPF or xdelta, or the .zip it came in)."
         if adding { panel.message = "Choose a patch to apply after \(([job.patch?.lastPathComponent].compactMap { $0 } + job.morePatches.map(\.lastPathComponent)).joined(separator: ", "))" }
         present(panel) { if let url = panel.url { adding ? c.addPatch(url, for: job.id) : c.setPatch(url, for: job.id) } }
+    }
+
+    private func pickCopyDestination() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Copy Here"
+        panel.message = "Choose where finished games are copied, such as a folder on an SD card. Games already there are skipped."
+        present(panel) { if let url = panel.url { c.copyDestination = url } }
     }
 
     private func pickPatches() {

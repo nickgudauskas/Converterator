@@ -14,6 +14,8 @@ struct RedumpIndex: Sendable {
     var roms: [String: [Rom]] = [:]
     /// How many track files (not counting the .cue) each game has.
     var trackCount: [String: Int] = [:]
+    /// Game name → redump.org system ("psx"), for DATs downloaded by system.
+    var system: [String: String] = [:]
     var gameCount: Int { trackCount.count }
     /// Changes whenever the loaded DATs change, so remembered "no match" results get rechecked.
     var stamp: String { "\(gameCount)-\(roms.count)" }
@@ -22,6 +24,7 @@ struct RedumpIndex: Sendable {
     mutating func merge(_ other: RedumpIndex) {
         for (k, v) in other.roms { roms[k, default: []] += v }
         trackCount.merge(other.trackCount) { a, _ in a }
+        system.merge(other.system) { a, _ in a }
     }
 
     /// Parses a Logiqx XML DAT (what redump.org publishes). Returns nil if it isn't one.
@@ -211,7 +214,8 @@ final class RedumpDB: ObservableObject {
         Task.detached {
             var merged = RedumpIndex(), loaded: [DAT] = [], failed: [String] = []
             for (url, slug) in sources {
-                if let one = RedumpDB.load(url) {
+                if var one = RedumpDB.load(url) {
+                    if let slug { for game in one.trackCount.keys { one.system[game] = slug } }
                     merged.merge(one); loaded.append(DAT(url: url, games: one.gameCount, system: slug))
                 } else {
                     failed.append(slug.map(RedumpDB.systemName) ?? url.lastPathComponent)

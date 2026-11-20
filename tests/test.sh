@@ -18,6 +18,7 @@ XDELTA=$(ls -d "$PWD"/vendor/xdelta3-*/ | head -1); XDELTA=${XDELTA%/}
 PSX="$PWD/vendor/$([[ "$(uname -m)" == arm64 ]] && echo osx-arm64 || echo osx-x64)"
 DOLPHIN=$(ls -d "$PWD"/vendor/dolphin-tool-*/ | head -1); DOLPHIN=${DOLPHIN%/}
 SEVENZ=$(ls -d "$PWD"/vendor/7zz-*/ | head -1); SEVENZ=${SEVENZ%/}
+MAXCSO=$(ls -d "$PWD"/vendor/maxcso-*/ | head -1); MAXCSO=${MAXCSO%/}
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/converterator-tests.XXXXXX")
 # The test program keeps its settings under its own name; remove them afterwards.
@@ -226,4 +227,4 @@ if ! swiftc -parse-as-library -swift-version 5 $(ls Sources/*.swift | grep -v '/
 fi
 
 echo "Running…"
-CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX:$DOLPHIN:$SEVENZ" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"
+CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX:$DOLPHIN:$SEVENZ:$MAXCSO" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"

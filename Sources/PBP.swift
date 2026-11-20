@@ -120,6 +120,7 @@ extension Converter {
         var summary = (pbpFolders ? "\(name)/EBOOT.PBP" : "\(name).pbp") + " · \(formatBytes(outSize))"
         if discs.count > 1 { summary += " · \(discs.count) discs" }
         if let firstPatch { summary += " · patched with \(firstPatch.lastPathComponent)" }
+        if let note = await copyToDevice([pbpFolders ? out.deletingLastPathComponent() : out], id: id) { summary += " · " + note }
         for d in discs {
             update(d.id) {
                 $0.state = .done; $0.progress = nil; $0.timed = true

@@ -13,7 +13,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
         // Fetch newer Redump DATs in the background (at most once a day; can be turned off in Settings).
-        MainActor.assumeIsolated { RedumpDB.shared.updateFromWeb() }
+        MainActor.assumeIsolated {
+            RedumpDB.shared.updateFromWeb()
+            WatchFolder.shared.restart()
+        }
     }
 
     /// The Finder service: adds the selected files and folders, and starts converting if that's turned on.

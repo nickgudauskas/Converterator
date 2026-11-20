@@ -113,12 +113,24 @@ func totalSize(_ urls: [URL]) -> Double {
 
 /// What a batch makes.
 enum OutputFormat: String, CaseIterable, Identifiable {
-    case chd, pbp
+    case chd, pbp, cso
     var id: String { rawValue }
-    var label: String { self == .chd ? "CHD" : "PBP for PSP / PS Vita" }
+    var label: String {
+        switch self {
+        case .chd: return "CHD"
+        case .pbp: return "PBP for PSP / PS Vita"
+        case .cso: return "CSO / ZSO for PSP and PS2"
+        }
+    }
 }
 
 /// How chdman should treat .iso files.
+enum SystemFolderStyle: String, CaseIterable, Identifiable {
+    case readable, esde
+    var id: String { rawValue }
+    var label: String { self == .readable ? "Readable (PlayStation, Saturn)" : "ES-DE, Batocera, RetroBat (psx, saturn)" }
+}
+
 enum ISOMode: String, CaseIterable, Identifiable {
     case automatic, cd, dvd
     var id: String { rawValue }
