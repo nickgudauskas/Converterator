@@ -16,6 +16,7 @@ jobs:
   build:
     name: Build (${{ matrix.arch }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: arm64
@@ -37,7 +38,7 @@ jobs:
         run: |
           cd maxcso
           cmake -S libuv -B build-uv -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_SHARED=OFF -DLIBUV_BUILD_TESTS=OFF \
-            -DBUILD_TESTING=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+            -DBUILD_TESTING=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build-uv --config Release -j 4
           UV_A=$(find build-uv -name 'libuv*.a' | head -1); echo "UV_A=$PWD/$UV_A" >> "$GITHUB_ENV"; echo "libuv: $UV_A"
           make -C lz4/lib liblz4.a -j 4
