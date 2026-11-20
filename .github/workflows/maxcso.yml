@@ -1,0 +1,125 @@
+# Builds a universal (Apple Silicon + Intel) maxcso from its official source and publishes it as a release of
+# this repository ("maxcso-1.13.0"), which build.sh downloads and bundles inside the app to make CSO and ZSO
+# files for real PSP and PS2 hardware. maxcso's own releases are Windows-only, so it's built here.
+# Run it by hand (Actions → Build maxcso → Run workflow).
+name: Build maxcso
+
+on:
+  workflow_dispatch:
+    inputs:
+      maxcso_version:
+        description: "maxcso release tag (e.g. v1.13.0)"
+        required: true
+        default: "v1.13.0"
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-15
+          - arch: x86_64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Get maxcso ${{ inputs.maxcso_version }} source (with its bundled libraries)
+        run: |
+          git clone --depth 1 --branch "${{ inputs.maxcso_version }}" --recurse-submodules --shallow-submodules \
+            https://github.com/unknownbrackets/maxcso.git maxcso
+          git -C maxcso rev-parse HEAD | tee source.commit
+
+      - name: Build libuv and lz4 (static, from maxcso's own copies)
+        run: |
+          cd maxcso
+          cmake -S libuv -B build-uv -DCMAKE_BUILD_TYPE=Release -DLIBUV_BUILD_SHARED=OFF -DLIBUV_BUILD_TESTS=OFF \
+            -DBUILD_TESTING=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          cmake --build build-uv --config Release -j 4
+          UV_A=$(find build-uv -name 'libuv*.a' | head -1); echo "UV_A=$PWD/$UV_A" >> "$GITHUB_ENV"; echo "libuv: $UV_A"
+          make -C lz4/lib liblz4.a -j 4
+          echo "LZ4_A=$PWD/lz4/lib/liblz4.a" >> "$GITHUB_ENV"
+
+      - name: Build maxcso
+        # Point the Makefile at the static libraries above (instead of pkg-config), and macOS's own zlib.
+        run: |
+          cd maxcso
+          make -j 4 maxcso \
+            CFLAGS_UV="-I$PWD/libuv/include" LIBS_UV="$UV_A" \
+            CFLAGS_LZ4="-I$PWD/lz4/lib" LIBS_LZ4="$LZ4_A" \
+            CFLAGS_ZLIB="" LIBS_ZLIB="-lz"
+          cp maxcso ../maxcso-bin
+          cd .. && mv maxcso-bin maxcso-built && file maxcso-built && otool -L maxcso-built
+
+      - name: Smoke test (an ISO to CSO and ZSO and back)
+        run: |
+          python3 -c "import os; open('test.iso','wb').write(os.urandom(1<<20) + bytes(3<<20))"
+          ./maxcso-built --format=cso1 test.iso -o test.cso
+          ./maxcso-built --format=zso test.iso -o test.zso
+          ./maxcso-built --decompress test.cso -o back-cso.iso
+          ./maxcso-built --decompress test.zso -o back-zso.iso
+          cmp test.iso back-cso.iso && cmp test.iso back-zso.iso && echo "round trips OK"
+          ls -l test.iso test.cso test.zso
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maxcso-${{ matrix.arch }}
+          path: |
+            maxcso-built
+            source.commit
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Combine into one universal maxcso
+        run: |
+          lipo -create maxcso-arm64/maxcso-built maxcso-x86_64/maxcso-built -output maxcso
+          chmod +x maxcso
+          lipo -info maxcso
+          # Nothing outside macOS itself may be linked (only the indented lines are libraries).
+          if otool -L maxcso | grep -E "^\s+/" | grep -vE "^\s+/(System/Library|usr/lib)/"; then
+            echo "maxcso links a library that isn't part of macOS"; exit 1
+          fi
+          if otool -L maxcso | grep -E "^\s+@"; then echo "maxcso expects bundled libraries"; exit 1; fi
+
+      - name: Package with maxcso's license
+        run: |
+          V="${{ inputs.maxcso_version }}"
+          COMMIT=$(cat maxcso-arm64/source.commit)
+          mkdir -p pkg
+          cp maxcso pkg/
+          curl -fsSL -o pkg/LICENSE.md "https://raw.githubusercontent.com/unknownbrackets/maxcso/${V}/LICENSE.md"
+          cat > pkg/SOURCE.txt <<EOF
+          maxcso ${V#v} by Unknown W. Brackets, built from the unmodified source:
+            https://github.com/unknownbrackets/maxcso/tree/${V}  (commit ${COMMIT}, with its submodules)
+
+          Built by this GitHub Actions run:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          on an Apple Silicon and an Intel Mac, with its own copies of libuv and lz4 built in, combined with lipo.
+
+          maxcso is under the ISC license; see LICENSE.md for it and the licenses of the libraries it includes.
+          EOF
+          sed -i '' 's/^          //' pkg/SOURCE.txt
+          (cd pkg && zip -qr ../maxcso-universal.zip .)
+          shasum -a 256 maxcso-universal.zip | tee maxcso-universal.zip.sha256
+
+      - name: Publish as a release (not marked latest, so the app's update check ignores it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.maxcso_version }}"; V="${V#v}"
+          SHA=$(cut -d' ' -f1 maxcso-universal.zip.sha256)
+          gh release delete "maxcso-${V}" -R "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "maxcso-${V}" maxcso-universal.zip -R "${{ github.repository }}" \
+            --title "maxcso ${V} (universal, for bundling)" --latest=false --target "${{ github.sha }}" \
+            --notes "Universal (Apple Silicon + Intel) maxcso built from the unmodified source of [maxcso v${V}](https://github.com/unknownbrackets/maxcso/tree/v${V}) by [this workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). \`build.sh\` downloads it and bundles it inside Converterator to make CSO and ZSO files. Includes maxcso's license and a SOURCE.txt saying exactly how it was built.
+
+          SHA-256 of \`maxcso-universal.zip\`: \`${SHA}\`"
