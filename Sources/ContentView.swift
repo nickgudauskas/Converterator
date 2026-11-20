@@ -393,10 +393,12 @@ struct ContentView: View {
             }
             HStack(spacing: 12) {
                 Toggle("Sort into a folder per system", isOn: $c.organizeBySystem)
+                    .fixedSize()
                     .disabled(c.outputFormat == .pbp)
                     .help("Saves each game in a folder named for its console, such as PlayStation/ or Saturn/ (or psx/, saturn/: choose the style in Settings). The console comes from the game's Redump match, or from the disc itself.")
                 Spacer()
-                Text("Copy finished games to:")
+                Text("Copy to:")
+                    .help("Copies each finished game to a folder, such as an SD card or a Steam Deck share. Games already there are skipped.")
                 Text(c.copyDestination.map { DiskSpace.volumeName($0) == $0.lastPathComponent ? $0.lastPathComponent : "\(DiskSpace.volumeName($0)) › \($0.lastPathComponent)" } ?? "Off")
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     .help(c.copyDestination?.path(percentEncoded: false) ?? "Copies each finished game to a folder, such as an SD card or a Steam Deck share.")
