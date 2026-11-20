@@ -13,7 +13,7 @@ Drop files or whole folders in, click **Convert**, and you're done.
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="docs/screenshot-light.png">
-    <img src="docs/screenshot-light.png" width="640" alt="Converterator window with five disc images queued for conversion">
+    <img src="docs/screenshot-light.png" width="640" alt="Converterator window with six games queued for conversion (an ECM file, a RAR archive and BIN/CUE discs), one with a translation patch from the patches box">
   </picture>
 </p>
 
