@@ -45,15 +45,18 @@ jobs:
           echo "LZ4_A=$PWD/lz4/lib/liblz4.a" >> "$GITHUB_ENV"
 
       - name: Build maxcso
-        # Point the Makefile at the static libraries above (instead of pkg-config), and macOS's own zlib.
+        # maxcso's Makefile links -luv -llz4 -lz: point it at the static libraries above (in a folder of their
+        # own, searched first) and macOS's own zlib, so nothing from Homebrew is used.
         run: |
           cd maxcso
+          mkdir -p ../static && cp "$UV_A" ../static/libuv.a && cp "$LZ4_A" ../static/liblz4.a
           make -j 4 maxcso \
-            CFLAGS_UV="-I$PWD/libuv/include" LIBS_UV="$UV_A" \
-            CFLAGS_LZ4="-I$PWD/lz4/lib" LIBS_LZ4="$LZ4_A" \
-            CFLAGS_ZLIB="" LIBS_ZLIB="-lz"
-          cp maxcso ../maxcso-bin
-          cd .. && mv maxcso-bin maxcso-built && file maxcso-built && otool -L maxcso-built
+            CXXFLAGS="-O2 -I$PWD/libuv/include -I$PWD/lz4/lib -L$PWD/../static -Wl,-search_paths_first"
+          cp maxcso ../maxcso-built
+          cd .. && file maxcso-built && otool -L maxcso-built
+          if otool -L maxcso-built | grep -E "^\s+/" | grep -vE "^\s+/(System/Library|usr/lib)/"; then
+            echo "links a library that isn't part of macOS"; exit 1
+          fi
 
       - name: Smoke test (an ISO to CSO and ZSO and back)
         run: |
