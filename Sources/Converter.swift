@@ -208,7 +208,12 @@ final class Converter: ObservableObject {
             jobs[i].patch = ordered[0]
             jobs[i].morePatches = Array(ordered.dropFirst())
         } else if !droppedPatches.isEmpty {
-            append("To use a patch, drop it together with its game, put it next to the game with the same name, or right-click the game → Add Patch….")
+            // Otherwise they join the patches box, and each goes to the game it was made for.
+            addPatches(droppedPatches)
+        }
+        // Patches added earlier find their games among the new ones.
+        if !addedPatches.isEmpty {
+            matchAddedPatches(to: newJobs.filter { $0.patch == nil && !$0.isExtraction && $0.state == .queued }.map { ($0.id, $0.url) })
         }
         // Games still without a patch: look in the patches folder, if one is set up.
         PatchLibrary.shared.lookUp(newJobs.filter { $0.patch == nil && !$0.isCHD && $0.state == .queued }.map { ($0.id, $0.url) })
@@ -237,6 +242,83 @@ final class Converter: ObservableObject {
         jobs[i].patchFromFolder = false   // chosen now, so it must fit
         if jobs[i].state != .queued { jobs[i].state = .queued; jobs[i].detail = "Waiting"; jobs[i].progress = nil; jobs[i].fraction = 0 }
         savedSignature = ""; saveQueueIfChanged()
+    }
+
+    // MARK: Patches box
+
+    /// Patches added in the main window's patches box (or dropped without a game). Each goes to the waiting
+    /// game it was made for, found the way the patches folder finds them (BPS and PPF by checksum, xdelta
+    /// and IPS by name), including games added later. One patch and one game: it goes to that game.
+    @Published private(set) var addedPatches: [URL] = []
+    @Published private(set) var matchingPatches = false
+
+    func addPatches(_ urls: [URL]) {
+        let fm = FileManager.default
+        var found: [URL] = []
+        func consider(_ f: URL) { if PatchFormat.of(f) != nil || Patcher.isPatchZip(f) { found.append(f.standardizedFileURL) } }
+        for u in urls {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
+            if isDir.boolValue {
+                let e = fm.enumerator(at: u, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                while let f = e?.nextObject() as? URL { consider(f) }
+            } else { consider(u) }
+        }
+        var seen = Set(addedPatches)
+        let new = found.filter { seen.insert($0).inserted }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        guard !new.isEmpty else {
+            if found.isEmpty { append("No IPS, BPS, PPF or xdelta patches (or zips of them) in what was added.") }
+            return
+        }
+        addedPatches += new
+        append("Added \(new.count == 1 ? new[0].lastPathComponent : "\(new.count) patches"): each goes to the game it was made for.")
+        matchAddedPatches(to: jobs.filter { $0.state == .queued && !$0.isExtraction && ($0.patch == nil || $0.patchFromFolder) }
+            .map { ($0.id, $0.url) })
+    }
+
+    /// Takes a patch out of the box, and off any waiting game it was given to.
+    func removeAddedPatch(_ patch: URL) {
+        addedPatches.removeAll { $0 == patch }
+        for j in jobs where j.state == .queued && j.patch == patch { setPatch(nil, for: j.id) }
+    }
+
+    func clearAddedPatches() { for p in addedPatches { removeAddedPatch(p) } }
+
+    /// The waiting games each added patch went to.
+    func gamesPatched(by patch: URL) -> [Job] { jobs.filter { $0.patch == patch || $0.morePatches.contains(patch) } }
+
+    /// Finds, in the background, which added patch each of these games needs, and gives it to them.
+    func matchAddedPatches(to games: [(UUID, URL)]) {
+        let patches = addedPatches
+        guard !patches.isEmpty else { return }
+        matchingPatches = true
+        let prefer = PatchLibrary.preferredLanguage
+        Task.detached {
+            let entries = PatchLibrary.index(files: patches)
+            var found: [(UUID, PatchLibrary.Entry)] = []
+            for (id, game) in games {
+                if let e = PatchLibrary.match(game: game, entries: entries, prefer: prefer) { found.append((id, e)) }
+            }
+            let results = found
+            await MainActor.run {
+                for (id, e) in results {
+                    // A patch you added wins over one the patches folder found.
+                    guard let j = self.jobs.first(where: { $0.id == id }), j.state == .queued,
+                          j.patch == nil || j.patchFromFolder else { continue }
+                    self.setPatch(e.url, member: e.member, for: id)
+                    self.append("Patch for \(j.url.lastPathComponent): \(e.member.map { "\(e.url.lastPathComponent) → \($0)" } ?? e.url.lastPathComponent)")
+                }
+                // One patch left over and one game without a patch: they go together.
+                let unused = self.addedPatches.filter { self.gamesPatched(by: $0).isEmpty }
+                let games = self.jobs.filter { !$0.isExtraction }
+                if unused.count == 1, games.count == 1, games[0].state == .queued, games[0].patch == nil {
+                    self.setPatch(unused[0], for: games[0].id)
+                    self.append("Patch for \(games[0].url.lastPathComponent): \(unused[0].lastPathComponent) (the only game in the list)")
+                }
+                self.matchingPatches = false
+            }
+        }
     }
 
     /// A patch the patches folder found for a waiting game that has none yet.

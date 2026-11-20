@@ -462,6 +462,49 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         plib.folder = nil
         c.clearAll()
 
+        // Patches box: patches added on their own go to the games they were made for
+        func waitForMatching() async { while c.matchingPatches { try? await Task.sleep(for: .milliseconds(50)) } }
+        let pb = W.appendingPathComponent("patch-box"); try? fm.createDirectory(at: pb, withIntermediateDirectories: true)
+        try! fm.copyItem(at: px.appendingPathComponent("Base (BPS).bps"), to: pb.appendingPathComponent("unrelated name.bps"))
+        try! fm.copyItem(at: px.appendingPathComponent("Two (Fixed).xdelta"), to: pb.appendingPathComponent("fix.xdelta"))
+        try! fm.copyItem(at: px.appendingPathComponent("Base (English).xdelta"), to: pb.appendingPathComponent("racingbaseenglish.xdelta"))
+        c.clearAll(); c.clearAddedPatches()
+        c.addPatches([pb.appendingPathComponent("unrelated name.bps"), pb.appendingPathComponent("fix.xdelta")])
+        check(c.addedPatches.count == 2 && c.jobs.isEmpty, "patches can be added before any game")
+        let boxGame = workspace("box-bps", from: F, ["patch/Base.cue", "patch/Base.bin"], into: W)
+        let boxTwo = workspace("box-two", from: F, ["two/Two.cue", "two/Two (Track 1).bin", "two/Two (Track 2).bin"], into: W)
+        c.add([boxGame.appendingPathComponent("Base.cue"), boxTwo.appendingPathComponent("Two.cue")]); await waitForMatching()
+        check(job(c.jobs, "Base.cue")?.patch?.lastPathComponent == "unrelated name.bps" && job(c.jobs, "Base.cue")?.patchFromFolder == false,
+              "a game added later gets the BPS made for it (by checksum)", job(c.jobs, "Base.cue")?.patch?.lastPathComponent ?? "none")
+        check(job(c.jobs, "Two.cue")?.patch == nil && c.gamesPatched(by: pb.appendingPathComponent("fix.xdelta").standardizedFileURL).isEmpty,
+              "a patch that matches no game waits (with two games, it isn't guessed)")
+        c.clearAll(); c.clearAddedPatches()
+        // By name, among two games; then converted with it
+        let boxName = W.appendingPathComponent("box-name"); try? fm.createDirectory(at: boxName, withIntermediateDirectories: true)
+        for f in ["Racing Base (Japan).cue", "Racing Base (Japan).bin"] { try! fm.copyItem(at: nf.appendingPathComponent(f), to: boxName.appendingPathComponent(f)) }
+        c.add([boxName.appendingPathComponent("Racing Base (Japan).cue"), boxTwo.appendingPathComponent("Two.cue")])
+        // A folder of patches (no BPS here: this game's track is the one the BPS was made for, so it would win)
+        let named = W.appendingPathComponent("patch-box-named"); try? fm.createDirectory(at: named, withIntermediateDirectories: true)
+        for f in ["fix.xdelta", "racingbaseenglish.xdelta"] { try! fm.copyItem(at: pb.appendingPathComponent(f), to: named.appendingPathComponent(f)) }
+        c.addPatches([named])
+        await waitForMatching()
+        check(c.addedPatches.count == 2, "a folder of patches adds each one")
+        check(job(c.jobs, "Racing Base (Japan).cue")?.patch?.lastPathComponent == "racingbaseenglish.xdelta",
+              "an xdelta goes to the game its name matches", job(c.jobs, "Racing Base (Japan).cue")?.patch?.lastPathComponent ?? "none")
+        c.remove(job(c.jobs, "Two.cue")!.id)
+        c.start(); while c.isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+        check(chdBin(boxName.appendingPathComponent("Racing Base (English).chd")) == wantPatched, "…and is applied", c.jobs.first?.detail ?? "")
+        c.clearAll(); c.clearAddedPatches()
+        // One game and one patch: they go together, even if nothing matches by name
+        c.add([boxTwo.appendingPathComponent("Two.cue")])
+        c.add([pb.appendingPathComponent("fix.xdelta")])   // dropped on its own: joins the patches box
+        await waitForMatching()
+        check(c.addedPatches.map(\.lastPathComponent) == ["fix.xdelta"], "a patch dropped on its own joins the patches box")
+        check(c.jobs.first?.patch?.lastPathComponent == "fix.xdelta", "one game and one patch go together")
+        c.removeAddedPatch(c.addedPatches[0])
+        check(c.addedPatches.isEmpty && c.jobs.first?.patch == nil, "removing a patch takes it off its game")
+        c.clearAll()
+
         // MARK: Stacked patches, patching a CHD, and patches in the Library Report
         // Translation, then a fix on top
         let st = workspace("stack", from: F, ["patch/Base.cue", "patch/Base.bin", "patch/Base (English).xdelta", "patch/bugfix.ips"], into: W)

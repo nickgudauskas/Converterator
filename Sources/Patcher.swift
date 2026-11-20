@@ -469,8 +469,12 @@ final class PatchLibrary: ObservableObject {
     /// Every patch in the folder (and its subfolders), including those inside zips, with what BPS and
     /// PPF patches say they're for.
     nonisolated static func index(_ folder: URL) -> [Entry] {
-        let files = (FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
+        index(files: FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
             .allObjects as? [URL] ?? [])
+    }
+
+    /// The patches among these files (and inside zips among them).
+    nonisolated static func index(files: [URL]) -> [Entry] {
         var entries: [Entry] = []
         func entry(url: URL, member: String?, name: String, data: () -> Data?) -> Entry? {
             guard let format = PatchFormat.byExtension[(name as NSString).pathExtension.lowercased()] else { return nil }

@@ -19,6 +19,7 @@ struct ContentView: View {
     @ObservedObject private var c = Converter.shared
     @ObservedObject private var updater = UpdateChecker.shared
     @State private var dropTargeted = false
+    @State private var patchTargeted = false
     @State private var showLog = false
     @State private var confirmCancel = false
     @State private var selection = Set<UUID>()
@@ -43,6 +44,8 @@ struct ContentView: View {
             .dropDestination(for: URL.self) { urls, _ in
                 c.add(urls); return true
             } isTargeted: { dropTargeted = $0 }
+
+            patchBox.padding(.horizontal, 12).padding(.top, 2).padding(.bottom, 10)
 
             Divider()
             options.padding(.horizontal, 14).padding(.vertical, 10)
@@ -223,9 +226,11 @@ struct ContentView: View {
         // Scrolls rather than overlapping when the window is short; centred when there's room.
         GeometryReader { geo in
             ScrollView {
-                VStack(spacing: 14) {
-                    Image(systemName: "opticaldisc").font(.system(size: 44)).foregroundStyle(.secondary)
-                    Text("Drop disc images or folders here").font(.title3)
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "opticaldisc").font(.system(size: 26)).foregroundStyle(.secondary)
+                        Text("Drop disc images or folders here").font(.title3)
+                    }
                     Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 7) {
                         if c.outputFormat == .pbp {
                             formatRow("PlayStation discs", "BIN/CUE, ISO, ECM, CHD", "PBP")
@@ -242,12 +247,66 @@ struct ContentView: View {
                     .font(.callout)
                     .padding(.vertical, 12).padding(.horizontal, 16)
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-                    Button("Add Files…", action: pickFiles).padding(.top, 2)
                 }
-                .padding(24)
+                .padding(.horizontal, 24).padding(.vertical, 14)
                 .frame(maxWidth: .infinity, minHeight: geo.size.height)
             }
         }
+    }
+
+    /// Where translation and other patches go: each is given to the game it was made for.
+    private var patchBox: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "bandage").font(.title2).foregroundStyle(Color.accentColor).frame(width: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                if c.addedPatches.isEmpty {
+                    Text("Translations and patches").font(.headline)
+                    Text("Drop IPS, BPS, PPF or xdelta patches here, or the zips they came in. Each one goes to the game it was made for.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack(spacing: 6) {
+                        Text(c.addedPatches.count == 1 ? "1 patch" : "\(c.addedPatches.count) patches").font(.headline)
+                        if c.matchingPatches { ProgressView().controlSize(.small) }
+                    }
+                    ForEach(c.addedPatches.prefix(3), id: \.self) { p in
+                        let games = c.gamesPatched(by: p)
+                        HStack(spacing: 4) {
+                            Text(p.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                            Image(systemName: "arrow.right").foregroundStyle(.tertiary)
+                            if games.isEmpty {
+                                Text(c.matchingPatches ? "looking for its game…" : "no game matched yet").foregroundStyle(.secondary)
+                            } else {
+                                Text(games.map(\.url.lastPathComponent).joined(separator: ", "))
+                                    .foregroundStyle(Color.accentColor).lineLimit(1).truncationMode(.middle)
+                            }
+                            Button { c.removeAddedPatch(p) } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.borderless).foregroundStyle(.tertiary).help("Remove this patch")
+                        }
+                        .font(.caption)
+                    }
+                    if c.addedPatches.count > 3 {
+                        Text("and \(c.addedPatches.count - 3) more").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 4) {
+                Button("Add Patches…", action: pickPatches)
+                if c.addedPatches.count > 1 {
+                    Button("Remove All") { c.clearAddedPatches() }.buttonStyle(.link).font(.caption)
+                }
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(patchTargeted ? 0.15 : 0.05)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(patchTargeted ? Color.accentColor : Color.secondary.opacity(0.4),
+                              style: StrokeStyle(lineWidth: patchTargeted ? 2 : 1, dash: [5, 4]))
+        )
+        .dropDestination(for: URL.self) { urls, _ in
+            c.addPatches(urls); return true
+        } isTargeted: { patchTargeted = $0 }
     }
 
     /// One line of the drop prompt: "CD and DVD images   BIN/CUE, GDI, ISO, ECM  →  CHD".
@@ -457,6 +516,15 @@ struct ContentView: View {
         panel.message = "Choose a patch for \(job.url.lastPathComponent) (IPS, BPS, PPF or xdelta, or the .zip it came in)."
         if adding { panel.message = "Choose a patch to apply after \(([job.patch?.lastPathComponent].compactMap { $0 } + job.morePatches.map(\.lastPathComponent)).joined(separator: ", "))" }
         present(panel) { if let url = panel.url { adding ? c.addPatch(url, for: job.id) : c.setPatch(url, for: job.id) } }
+    }
+
+    private func pickPatches() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.allowedContentTypes = (Array(PatchFormat.byExtension.keys) + ["zip"]).compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.message = "Choose IPS, BPS, PPF or xdelta patches, the zips they came in, or folders of them. Each one goes to the game it was made for."
+        present(panel) { c.addPatches(panel.urls) }
     }
 
     private func pickFiles() {
