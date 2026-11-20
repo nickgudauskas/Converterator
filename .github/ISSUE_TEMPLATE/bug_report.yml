@@ -1,0 +1,47 @@
+name: Bug report
+description: Something didn't convert, crashed, or did the wrong thing.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. The quickest way to fill most of this in: in Converterator, choose
+        **Help → Copy Diagnostic Info**, and paste it in the box below. It has your Converterator and macOS
+        versions, your Mac, the built-in tools and the recent log (with your home folder shortened to `~`).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Include any message the app showed.
+      placeholder: "I dropped a .rar with a .cue and .bin inside, clicked Convert, and it said …"
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: What did you add?
+      description: The kind of file (for example a .cue with 3 .bin tracks, a split .rar, a .bin.ecm, a .chd) and the system it's for. No need to share the files themselves.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic info
+      description: Paste from Help → Copy Diagnostic Info. Check it first if you'd rather not share file names.
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Converterator version
+      description: Only needed if you didn't paste the diagnostic info. It's in Converterator → About Converterator.
+      placeholder: "1.20.1"
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Downloaded from GitHub
+        - Homebrew
+        - Built it myself

@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest something Converterator could do, or do better.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: What you'd like Converterator to do, and what you'd use it for.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: How do you do it now?
+      description: Another app, a script, by hand, or not at all. This helps get the details right.
+  - type: input
+    id: systems
+    attributes:
+      label: Which systems or file types?
+      placeholder: "e.g. Saturn, PS2 .iso, .cso"

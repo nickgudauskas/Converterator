@@ -89,6 +89,17 @@ struct AppCommands: Commands {
                 .keyboardShortcut("k", modifiers: [.command, .shift])
                 .disabled(c.isRunning || c.jobs.isEmpty)
         }
+        CommandGroup(replacing: .help) {
+            Button("Converterator Help") {
+                NSWorkspace.shared.open(URL(string: "https://github.com/\(UpdateChecker.repo)#readme")!)
+            }
+            Divider()
+            Button("Copy Diagnostic Info") { Diagnostics.copy() }
+            Button("Report a Bug…") { Diagnostics.reportBug() }
+            Button("Suggest a Feature…") {
+                NSWorkspace.shared.open(URL(string: "https://github.com/\(UpdateChecker.repo)/issues/new?template=feature_request.yml")!)
+            }
+        }
         CommandGroup(after: .toolbar) {
             Button("Show or Hide Log") { NotificationCenter.default.post(name: .toggleLog, object: nil) }
                 .keyboardShortcut("l")

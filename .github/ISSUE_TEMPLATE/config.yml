@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How Converterator works
+    url: https://github.com/thepoisonninja/Converterator#readme
+    about: What it converts, patches, Redump checks and the other tools, explained in the README.

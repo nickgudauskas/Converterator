@@ -129,6 +129,8 @@ cp vendor/osx-arm64/psxpackager "$PSX/psxpackager-arm64"
 cp vendor/osx-x64/psxpackager "$PSX/psxpackager-x86_64"
 cp -R vendor/osx-arm64/Resources "$PSX/Resources"   # identical in both builds
 cp vendor/LICENSE-psxpackager "$PSX/LICENSE"
+printf 'PSXPackager %s by RupertAvery (https://github.com/RupertAvery/PSXPackager), the official macOS builds for\nApple Silicon and Intel from https://github.com/RupertAvery/PSXPackager/releases/tag/%s. MIT License (see LICENSE).\n' \
+  "$PSX_VERSION" "$PSX_VERSION" > "$PSX/SOURCE.txt"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 # chdman with MAME's licenses and a note on exactly which source it was built from
 ditto "vendor/chdman-$CHDMAN_VERSION" "$APP/Contents/Resources/chdman"

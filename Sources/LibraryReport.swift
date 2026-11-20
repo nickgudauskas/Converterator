@@ -48,6 +48,24 @@ struct LibraryReport: Sendable {
     var missingDiscs: [MissingDiscs] = []
     var needsPlaylist: [NeedsPlaylist] = []
 
+    /// Copies of the same disc: CHDs holding the same data, or files matching the same Redump game.
+    struct IdenticalCopies: Identifiable, Sendable {
+        let id = UUID()
+        let files: [URL]
+        let why: String
+        /// What deleting all but the biggest copy would free.
+        var extraBytes: Double { totalSize(files) - (files.map { totalSize([$0]) }.max() ?? 0) }
+    }
+    /// The same game in more than one version (region, language, revision or patch), not identical.
+    struct Versions: Identifiable, Sendable {
+        let id = UUID()
+        let title: String
+        let files: [URL]
+    }
+    var identical: [IdenticalCopies] = []
+    var identicalBytes = 0.0
+    var versions: [Versions] = []
+
     nonisolated static func build(folder: URL, outputDir: URL?, sevenZip: URL?, log: [String: [String]],
                                   redump: RedumpIndex, checked: [String: RedumpCache.Entry] = [:],
                                   patchesFolder: URL? = nil, preferLanguage: String? = nil,
@@ -110,6 +128,12 @@ struct LibraryReport: Sendable {
         }
         r.needsPlaylist.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
+        status("Looking for duplicates…")
+        let rvzs = all.filter { $0.pathExtension.lowercased() == "rvz" }
+        (r.identical, r.versions) = duplicates(compressed: r.chds + rvzs, originals: unconverted,
+                                               checked: checked, datStamp: redump.stamp)
+        r.identicalBytes = r.identical.reduce(0) { $0 + $1.extraBytes }
+
         if let patchesFolder {
             status("Looking for patches for your games…")
             r.patchesFolderOn = true
@@ -117,6 +141,86 @@ struct LibraryReport: Sendable {
                                         unconverted: unconverted, leftovers: r.leftovers, chds: r.chds)
         }
         return r
+    }
+
+    /// The SHA-1 of the disc data a CHD holds, from its header (CHD versions 4 and 5), without reading the rest.
+    nonisolated static func chdDataSHA1(_ url: URL) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard let d = try? h.read(upToCount: 124), d.count >= 108, d.prefix(8) == Data("MComprHD".utf8) else { return nil }
+        let version = d[12...15].reduce(0) { $0 << 8 | Int($1) }
+        let offset: Int
+        switch version {
+        case 5 where d.count >= 124: offset = 64
+        case 4: offset = 88
+        default: return nil
+        }
+        let sha = d[offset..<(offset + 20)]
+        guard sha.contains(where: { $0 != 0 }) else { return nil }
+        return sha.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// A game's title without its tags and disc number: "Racing Lagoon (Japan, Asia) (Disc 1)" → "Racing Lagoon".
+    nonisolated static func plainTitle(_ name: String) -> String {
+        var t = DiscName.parse(name)?.key ?? name
+        if let r = t.range(of: #"\s*[\(\[]"#, options: .regularExpression) { t = String(t[..<r.lowerBound]) }
+        return t.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Identical copies (same CHD data, or the same Redump match) among the CHDs and RVZs, and games kept in
+    /// more than one version among those and the not-yet-converted originals (same title and disc number).
+    nonisolated static func duplicates(compressed: [URL], originals: [URL], checked: [String: RedumpCache.Entry],
+                                       datStamp: String) -> ([IdenticalCopies], [Versions]) {
+        // Group the CHDs and RVZs that share a data SHA-1 or a Redump match (either joins them).
+        var parent = Array(compressed.indices)
+        func find(_ i: Int) -> Int { var i = i; while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }; return i }
+        var firstWith: [String: Int] = [:]
+        var why: [Int: String] = [:]
+        for (i, f) in compressed.enumerated() {
+            var keys: [(String, String)] = []
+            if f.pathExtension.lowercased() == "chd", let sha = chdDataSHA1(f) { keys.append(("data:" + sha, "same disc data")) }
+            if case .match(let game) = RedumpCache.result(for: f, in: checked, datStamp: datStamp) {
+                keys.append(("redump:" + game, "both match Redump's “\(game)”"))
+            }
+            for (k, reason) in keys {
+                if let j = firstWith[k] {
+                    let (a, b) = (find(i), find(j))
+                    if a != b { parent[a] = b }
+                    why[find(i)] = why[find(i)] ?? reason
+                } else { firstWith[k] = i }
+            }
+        }
+        var groups: [Int: [Int]] = [:]
+        for i in compressed.indices { groups[find(i), default: []].append(i) }
+        var identical: [IdenticalCopies] = []
+        var groupOf: [URL: Int] = [:]
+        for (root, members) in groups where members.count > 1 {
+            let files = members.map { compressed[$0] }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            let reason = why[root] ?? members.compactMap { why[$0] }.first ?? "same disc data"
+            identical.append(IdenticalCopies(files: files, why: files.count > 2 ? reason.replacingOccurrences(of: "both match", with: "all match") : reason))
+            for f in files { groupOf[f] = identical.count - 1 }
+        }
+        identical.sort { $0.files[0].lastPathComponent.localizedStandardCompare($1.files[0].lastPathComponent) == .orderedAscending }
+
+        // The same title and disc number in more than one file, unless they're all copies of one disc.
+        var byTitle: [String: (title: String, files: [URL])] = [:]
+        for f in compressed + originals {
+            let name = Converter.gameName(f)
+            let title = plainTitle(name)
+            let key = PatchLibrary.key(title)
+            guard key.count >= 2 else { continue }
+            let disc = DiscName.parse(name)?.disc ?? 0
+            let k = key + "#\(disc)"
+            byTitle[k, default: (disc > 0 ? "\(title) (Disc \(disc))" : title, [])].files.append(f)
+        }
+        var versions: [Versions] = []
+        for (_, v) in byTitle where v.files.count > 1 {
+            let groupsHere = Set(v.files.map { groupOf[$0] ?? -1 })
+            if groupsHere.count == 1, groupsHere.first != -1 { continue }   // all one identical set
+            versions.append(Versions(title: v.title, files: v.files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }))
+        }
+        versions.sort { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        return (identical, versions)
     }
 
     /// Games (originals not converted yet, originals with CHDs, and CHDs on their own) with a patch in
@@ -163,6 +267,12 @@ extension LibraryReport {
         }
         for p in needsPlaylist { rows.append(["Needs a playlist", p.name + ".m3u", p.dir.path, "\(p.discs.count) discs", ""]) }
         for o in patchOffers { add("Patches available", o.game, name: o.name + ".chd", "from \(o.game.lastPathComponent) with \(o.patch.member ?? o.patch.name)") }
+        for (n, g) in identical.enumerated() {
+            for f in g.files { add("Identical copies", f, "set \(n + 1): \(g.why)", size: totalSize([f])) }
+        }
+        for v in versions {
+            for f in v.files { add("Several versions", f, v.title, size: totalSize([f])) }
+        }
         for u in redumpNotMatching { add("Don't match Redump", u, size: totalSize([u])) }
         for u in redumpUnchecked { add("Not checked against Redump", u, size: totalSize([u])) }
         func cell(_ s: String) -> String { s.contains(where: { ",\"\n".contains($0) }) ? "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" : s }
@@ -186,6 +296,10 @@ extension LibraryReport {
         })
         section("Multi-disc games without a playlist", needsPlaylist.map { "\($0.name) (\($0.discs.count) discs)" })
         if patchesFolderOn { section("Patches available", patchOffers.map { "\($0.name).chd  from \($0.game.lastPathComponent)" }) }
+        section("Identical copies (could free \(formatBytes(identicalBytes)))", identical.map {
+            $0.files.map(\.lastPathComponent).joined(separator: " = ") + "  (\($0.why))"
+        })
+        section("Games in several versions", versions.map { "\($0.title): " + $0.files.map(\.lastPathComponent).joined(separator: ", ") })
         section("Don't match Redump", redumpNotMatching.map(\.lastPathComponent))
         out += "\nMatch Redump: \(redumpMatched)   Not checked yet: \(redumpUnchecked.count)\n"
         return out
@@ -262,7 +376,7 @@ struct LibraryView: View {
             } else if let r = m.report {
                 report(r)
             } else {
-                Text("The report shows which games are converted, which aren't, originals you can clean up, multi-disc games with a disc missing, and ones without a playlist. Nothing is changed until you click an action.")
+                Text("The report shows which games are converted, which aren't, originals you can clean up, multi-disc games with a disc missing, identical copies, games kept in several versions, and ones without a playlist. Nothing is changed until you click an action.")
                     .foregroundStyle(.secondary)
                 Spacer()
             }
@@ -321,6 +435,37 @@ struct LibraryView: View {
                     .contextMenu { Button("Show in Finder") { NSWorkspace.shared.open(set.dir) } }
                 }
             } header: { header("Multi-disc games with a disc missing: \(r.missingDiscs.count)", nil, action: nil) }
+
+            Section {
+                if r.identical.isEmpty { Text("No identical copies.").foregroundStyle(.secondary) }
+                ForEach(r.identical.prefix(200)) { g in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(g.why.prefix(1).uppercased() + g.why.dropFirst() + " · could free \(formatBytes(g.extraBytes))")
+                            .font(.caption).foregroundStyle(.orange)
+                        ForEach(g.files, id: \.self) { f in
+                            fileRow(f, detail: formatBytes(totalSize([f])))
+                        }
+                    }
+                }
+                more(r.identical.count)
+            } header: {
+                header("Identical copies: \(r.identical.count)", r.identical.isEmpty ? nil : "could free \(formatBytes(r.identicalBytes))", action: nil)
+            }
+
+            Section {
+                if r.versions.isEmpty { Text("No game is here in more than one version.").foregroundStyle(.secondary) }
+                ForEach(r.versions.prefix(200)) { v in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(v.title).fontWeight(.medium)
+                        ForEach(v.files, id: \.self) { f in
+                            fileRow(f, detail: formatBytes(totalSize(Converter.sourceFiles(for: f))))
+                        }
+                    }
+                }
+                more(r.versions.count)
+            } header: {
+                header("Games in several versions: \(r.versions.count)", nil, action: nil)
+            }
 
             Section {
                 if !r.patchesFolderOn {

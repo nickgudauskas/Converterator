@@ -313,6 +313,44 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
               && csv.contains("Missing discs,Game B,") && csv.contains("\"has 1, 3; missing 2\""), "report exports as CSV (with quoting)")
         let txt = r.text(folder: lib)
         check(txt.contains("Not converted yet: 1") && txt.contains("Game B: has disc 1, 3; missing 2"), "report exports as text")
+        // Duplicates: stand-in CHDs whose headers name their disc data (a v5 header is all that's read)
+        func fakeCHD(_ url: URL, data: UInt8, size: Int = 4096) {
+            var d = Data("MComprHD".utf8) + Data([0, 0, 0, 124, 0, 0, 0, 5]) + Data(count: 48)
+            d += Data(repeating: data, count: 20) + Data(count: 40)
+            d += Data(count: size - d.count)
+            try! d.write(to: url)
+        }
+        let dup = W.appendingPathComponent("dups"); try? fm.createDirectory(at: dup.appendingPathComponent("more"), withIntermediateDirectories: true)
+        fakeCHD(dup.appendingPathComponent("Alpha (USA).chd"), data: 1)
+        fakeCHD(dup.appendingPathComponent("more/Alpha (USA) copy.chd"), data: 1, size: 8192)
+        fakeCHD(dup.appendingPathComponent("Alpha (Japan).chd"), data: 2)
+        fakeCHD(dup.appendingPathComponent("Gamma (USA).chd"), data: 3)
+        fakeCHD(dup.appendingPathComponent("gamma.chd"), data: 4)
+        fakeCHD(dup.appendingPathComponent("Epsilon (Disc 1).chd"), data: 5)
+        fakeCHD(dup.appendingPathComponent("Epsilon (Disc 2).chd"), data: 6)
+        fakeCHD(dup.appendingPathComponent("Zeta.chd"), data: 7)
+        fakeCHD(dup.appendingPathComponent("more/Zeta.chd"), data: 7)
+        try! fm.copyItem(at: F.appendingPathComponent("plain.iso"), to: dup.appendingPathComponent("Alpha (Europe).iso"))
+        RedumpCache.store(dup.appendingPathComponent("Gamma (USA).chd"), .match("Gamma (USA)"))
+        RedumpCache.store(dup.appendingPathComponent("gamma.chd"), .match("Gamma (USA)"))
+        check(LibraryReport.chdDataSHA1(F.appendingPathComponent("chd/game.chd"))?.count == 40
+              && LibraryReport.chdDataSHA1(F.appendingPathComponent("plain.iso")) == nil, "reads a CHD's data SHA-1 from its header")
+        let dr = LibraryReport.build(folder: dup, outputDir: nil, sevenZip: nil, log: [:], redump: db.index,
+                                     checked: RedumpCache.all()) { _ in }
+        let sets = dr.identical.map { $0.files.map(\.lastPathComponent).sorted() }
+        check(sets.contains(["Alpha (USA) copy.chd", "Alpha (USA).chd"]), "identical copies: same disc data, whatever the name", "\(sets)")
+        check(sets.contains(["Gamma (USA).chd", "gamma.chd"])
+              && dr.identical.first { $0.files.contains { $0.lastPathComponent == "gamma.chd" } }?.why.contains("Redump") == true,
+              "identical copies: both match the same Redump game", "\(sets)")
+        check(sets.contains(["Zeta.chd", "Zeta.chd"]) && sets.count == 3, "identical copies in different folders, and nothing else", "\(sets)")
+        check(dr.identicalBytes == 4096 * 3, "counts what deleting the extra copies would free", "\(dr.identicalBytes)")
+        let versions = Dictionary(uniqueKeysWithValues: dr.versions.map { ($0.title, $0.files.map(\.lastPathComponent).sorted()) })
+        check(versions["Alpha"] == ["Alpha (Europe).iso", "Alpha (Japan).chd", "Alpha (USA) copy.chd", "Alpha (USA).chd"],
+              "several versions: regions, including one not converted yet", "\(versions)")
+        check(versions.count == 1, "discs 1 and 2 of a game, and identical copies alone, aren't versions", "\(versions.keys.sorted())")
+        check(dr.csv().contains("Identical copies,") && dr.csv().contains("Several versions,Alpha (Japan).chd")
+              && dr.text(folder: dup).contains("Games in several versions: 1"), "duplicates are in the exports")
+
         // Ambiguous: two originals pointing at one CHD in a shared folder are left out of cleanup
         let shared = W.appendingPathComponent("shared"); let a1 = W.appendingPathComponent("amb1"), a2 = W.appendingPathComponent("amb2")
         for d in [shared, a1, a2] { try? fm.createDirectory(at: d, withIntermediateDirectories: true) }
@@ -735,6 +773,19 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         DiskSpace.override = nil
         check(c.batchSpaceWarning() == nil, "no warning when there's room")
         c.clearAll()
+
+        // MARK: Diagnostic info
+        section("Diagnostic info")
+        check(Diagnostics.versionPart("chdman 0.289, built from the unmodified source of MAME 0.289:") == "chdman 0.289"
+              && Diagnostics.versionPart("7-Zip 26.06 by Igor Pavlov (https://www.7-zip.org), the official") == "7-Zip 26.06"
+              && Diagnostics.versionPart("dolphin-tool from Dolphin 2609b, built from the unmodified source:") == "dolphin-tool from Dolphin 2609b"
+              && Diagnostics.versionPart("PSXPackager v1.8.0 by RupertAvery (https://github.com/RupertAvery/PSXPackager), the") == "PSXPackager v1.8.0",
+              "tool versions read from their SOURCE.txt")
+        c.append("converted \(NSHomeDirectory())/Games/Test.cue")
+        let diag = Diagnostics.report()
+        check(diag.hasPrefix("Converterator ") && diag.contains("\nmacOS ") && diag.contains("chdman: ") && diag.contains("7-Zip: ")
+              && diag.contains("Settings\n") && diag.contains("Recent log (last") && !diag.contains("macOS Version"), "the report has versions, tools, settings and the log")
+        check(!diag.contains(NSHomeDirectory()) && diag.contains("~/Games/Test.cue"), "your home folder is shortened to ~")
 
         // MARK: Updater
         section("Updater checks")
