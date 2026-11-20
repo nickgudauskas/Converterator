@@ -854,18 +854,22 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         check(Set(c.jobs.map(\.url.lastPathComponent)) == ["psp.iso", "ps2.iso", "game.cue"], "making CSO/ZSO, a folder scan picks up the games")
         jobs = await runBatch([cso.appendingPathComponent("psp.iso"), cso.appendingPathComponent("ps2.iso"), cso.appendingPathComponent("game.cue"),
                                csoCHD.appendingPathComponent("ps2.chd")])
+        var unpackNote = ""
         func unpacked(_ f: URL) -> String? {
             let out = W.appendingPathComponent("cso-check-\(UUID().uuidString).iso")
             defer { try? fm.removeItem(at: out) }
             let p = Process(); p.executableURL = Converter.findTool("maxcso"); p.arguments = ["--decompress", f.path, "-o", out.path]
-            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-            try? p.run(); p.waitUntilExit()
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+            do { try p.run() } catch { unpackNote = "couldn't run maxcso: \(error)"; return nil }
+            let said = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            p.waitUntilExit()
+            unpackNote = "maxcso exit \(p.terminationStatus), \(Int(totalSize([out]))) bytes: \(said.suffix(300))"
             return sha1(out)
         }
         check(job(jobs, "psp.iso")?.state == .done && unpacked(cso.appendingPathComponent("psp.cso")) == sha1(F.appendingPathComponent("psp.iso")),
-              "a PSP ISO becomes a CSO holding the same ISO", job(jobs, "psp.iso")?.detail ?? "")
+              "a PSP ISO becomes a CSO holding the same ISO", (job(jobs, "psp.iso")?.detail ?? "") + " / " + unpackNote)
         check(job(jobs, "ps2.iso")?.state == .done && unpacked(cso.appendingPathComponent("ps2.zso")) == sha1(F.appendingPathComponent("ps2.iso"))
-              && job(jobs, "ps2.iso")?.detail.contains("verified") == true, "a PS2 ISO becomes a ZSO (for OPL), verified", job(jobs, "ps2.iso")?.detail ?? "")
+              && job(jobs, "ps2.iso")?.detail.contains("verified") == true, "a PS2 ISO becomes a ZSO (for OPL), verified", (job(jobs, "ps2.iso")?.detail ?? "") + " / " + unpackNote)
         check(job(jobs, "ps2.chd")?.state == .done && unpacked(csoCHD.appendingPathComponent("ps2.zso")) == sha1(F.appendingPathComponent("ps2.iso")),
               "a DVD CHD is unpacked and becomes a ZSO", job(jobs, "ps2.chd")?.detail ?? "")
         check(job(jobs, "game.cue")?.state == .failed && job(jobs, "game.cue")?.detail.contains("CD image") == true,
