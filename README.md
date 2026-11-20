@@ -25,7 +25,8 @@ Drop files or whole folders in, click **Convert**, and you're done.
 | `.cue` + `.bin` | Compressed straight to CHD with `chdman`. |
 | `.gdi` | Compressed straight to CHD with `chdman`. |
 | `.iso` | Compressed straight to CHD with `chdman`, as a DVD or CD image (see below). |
-| `.zip`, `.7z` | Unpacked to a temporary folder, then every `.pbp`, `.cue`, `.gdi` or `.iso` inside is converted as above. The temporary files are deleted afterwards. `.7z` needs 7-Zip (`brew install sevenzip`). |
+| `.zip`, `.7z`, `.rar` | Unpacked to a temporary folder, then every `.pbp`, `.cue`, `.gdi`, `.iso` or `.ecm` inside is converted as above. The temporary files are deleted afterwards. `.7z` and `.rar` are unpacked with the built-in 7-Zip, including RAR archives split into parts (`Game.part1.rar`, `Game.part2.rar`…, or `Game.rar` with `Game.r00`, `Game.r01`…). |
+| `.ecm` (`Game.bin.ecm`) | Expanded back to the original `.bin` (ECM leaves out each sector's error-correction data, which is computed again and checked against the checksum stored in the file), then compressed as above. A `.cue` whose tracks are `.ecm` files works as it is. A lone `Game.bin.ecm` with no `.cue` gets one made for it (one data track). |
 | GameCube and Wii: `.iso`, `.gcm`, `.wbfs`, `.ciso`, `.gcz`, `.wia` | Compressed to **RVZ** (Dolphin's format) with the built-in `dolphin-tool`: zstd level 5, 128 KiB blocks, as Dolphin recommends. GameCube and Wii `.iso` files are recognised from their contents, so they're never made into CHDs. |
 | `.rvz` | Extracted back to a plain `.iso`. |
 | `.chd` | Extracted back to `.cue` + `.bin` (CDs), `.gdi` + tracks (Dreamcast) or `.iso` (DVDs). |
@@ -34,7 +35,9 @@ Dropping a `.bin` on its own uses the `.cue` with the same name next to it.
 
 **ISO images: CD or DVD.** PS2 and PSP games need DVD-type CHDs (`chdman createdvd`, made with 2048-byte hunks as PPSSPP and PCSX2 recommend; chdman's own default since 0.263 is 4096), and most other systems need CD-type ones. With **ISO images: Automatic**, Converterator looks inside each ISO: a PSP game (`PSP_GAME`) or a PS2 game (`SYSTEM.CNF` with `BOOT2`) becomes a DVD CHD, as does anything too big to fit on a CD. Everything else becomes a CD CHD. The log says which was chosen and why. Choose **Always CD** or **Always DVD** to override it. PS2 games that came on CD are best kept as BIN/CUE, which always becomes a CD CHD.
 
-**Archives.** Dropping a `.zip` or `.7z` always adds it. A folder scan only picks up archives with a disc image inside, so a folder of zipped cartridge games doesn't fill the list. CHDs are named after the disc image inside, and saved next to the archive (or in your **Save to:** folder).
+**Archives.** Dropping a `.zip`, `.7z` or `.rar` always adds it. A folder scan only picks up archives with a disc image inside, so a folder of zipped cartridge games doesn't fill the list. CHDs are named after the disc image inside, and saved next to the archive (or in your **Save to:** folder). A split RAR is added once, through its first part (dropping any part adds the first), and **Move source files to Trash** and **Clean Up Originals** treat all its parts as one original. A password-protected archive fails with a message instead of asking for the password.
+
+**ECM files.** Dropping a `Game.bin.ecm` uses the `.cue` that lists `Game.bin` next to it, if there is one. The original `.ecm` files are what count as the game's originals for **Move source files to Trash** and **Clean Up Originals**; the expanded `.bin` is temporary.
 
 **Extracting CHDs.** `.chd` files are only picked up when you add them one by one, never from a folder scan, so re-adding a folder you already converted doesn't unpack everything in it.
 
@@ -105,6 +108,7 @@ That's all. The tools Converterator uses are built into the app:
 - **PSXPackager**, which carries its own copy of .NET.
 - **dolphin-tool** (from Dolphin), for GameCube and Wii discs, in a universal build made from Dolphin's source (see [How chdman is built](#how-chdman-is-built); dolphin-tool is built the same way).
 - **xdelta3**, for xdelta patches: the project's own dependency-free macOS builds for Apple Silicon and Intel, combined into one.
+- **7-Zip** (`7zz`), for `.7z` and `.rar` archives: the official macOS builds for Apple Silicon and Intel, combined into one.
 
 Converterator uses its built-in chdman. If that's ever missing, it falls back to one installed with Homebrew (`brew install rom-tools`), and if there's none, a banner explains how to install it. Releases before 1.13.0 didn't include chdman and needed the Homebrew one.
 
@@ -179,6 +183,8 @@ swift make_icon.swift
 | `tests/test.sh`, `tests/Tests.swift` | The tests (see below). Run on every push by `.github/workflows/tests.yml`, on an Apple Silicon and an Intel Mac. |
 | `.github/workflows/dolphin-tool.yml` | Builds the bundled universal dolphin-tool from Dolphin's source. |
 | `Sources/Nintendo.swift` | GameCube and Wii: recognising discs, RVZ with dolphin-tool. |
+| `Sources/ECM.swift` | Expanding `.ecm` files (recomputing each sector's EDC/ECC). |
+| `tests/make_ecm.py`, `tests/make_rar.py`, `tests/make_ps1_disc.py` | Make the ECM, RAR and PS1 test fixtures without other tools. |
 | `.github/workflows/chdman.yml` | Builds the bundled universal chdman from MAME's source (see [How chdman is built](#how-chdman-is-built)). |
 | `release.sh` | Tests, builds, notarizes and publishes a release (see below). |
 | `build.sh` | Downloads PSXPackager if needed, compiles, and assembles and signs `Converterator.app`. |
@@ -194,6 +200,8 @@ swift make_icon.swift
 - [chdman](https://docs.mamedev.org/tools/chdman.html) from the MAME project, for CHD compression.
 - [xdelta](https://github.com/jmacd/xdelta) by Joshua MacDonald, for applying xdelta patches.
 - [Dolphin](https://dolphin-emu.org)'s `dolphin-tool`, for GameCube and Wii discs (RVZ).
+- [7-Zip](https://www.7-zip.org) by Igor Pavlov, for `.7z` and `.rar` archives.
+- The ECM format is Neill Corlett's (ecm/unecm). Converterator expands it with its own code.
 
 Converterator doesn't modify any of these tools. It runs them as separate programs, and the app includes an unmodified copy of each, which `build.sh` downloads.
 
@@ -207,4 +215,4 @@ To move to a newer MAME: run **Actions → Build chdman → Run workflow** with 
 
 ## License
 
-Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. dolphin-tool is part of Dolphin, under the GNU General Public License, version 2 or later; its license and `SOURCE.txt` are in `Contents/Resources/dolphin-tool`. xdelta3 is under the Apache License 2.0; its license is included at `Contents/Resources/xdelta3/LICENSE`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.
+Converterator is released under the [MIT License](LICENSE). PSXPackager, bundled inside the app, is also MIT-licensed. Its license is included in the app at `Contents/Resources/psxpackager/LICENSE`. dolphin-tool is part of Dolphin, under the GNU General Public License, version 2 or later; its license and `SOURCE.txt` are in `Contents/Resources/dolphin-tool`. xdelta3 is under the Apache License 2.0; its license is included at `Contents/Resources/xdelta3/LICENSE`. 7-Zip is under the GNU LGPL (with the unRAR license restriction for its RAR decoder, and BSD licenses for some parts); its `License.txt` and a `SOURCE.txt` saying where it came from are in `Contents/Resources/7zz`. chdman is part of MAME, which is distributed under the GNU General Public License, version 2 (chdman's own source file is BSD-3-Clause). The bundled copy comes with MAME's license texts in `Contents/Resources/chdman` (`COPYING` and `legal/`), and `SOURCE.txt` there says exactly which MAME source it was built from. Converterator runs chdman as a separate program; Converterator's own code stays under the MIT License.

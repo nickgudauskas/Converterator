@@ -18,6 +18,10 @@ DOLPHIN_SHA256="04336ad3421256f1019ff1831d3274460782f22c20b828daa5b904455aa26ef0
 XDELTA_VERSION="3.2.2"
 XDELTA_SHA256_ARM64="27dcf763beb075ed28061ef136613f4bc6ea3999cb424f23a7d59f18ca2d7c8b"
 XDELTA_SHA256_X86_64="e217f4d0f92357ee890f9d8b5571f7eb836a86ff87e8834bed0b9d9b38630f86"
+# 7-Zip (7zz), for .7z and .rar archives: the official macOS builds by Igor Pavlov (LGPL, unRAR restriction).
+SEVENZIP_VERSION="26.06"
+SEVENZIP_SHA256_ARM64="b6f17920b4240940461dac8ef4009891881ac44d2a5ead625ede2ec8472185dd"
+SEVENZIP_SHA256_X86_64="3af68b124052da7fc2a246c96b0bea6a68bfee389baa788f4cead1a133445586"
 
 # PSXPackager isn't stored in this repo; fetch both macOS release builds once into vendor/.
 # It's a .NET single-file app, which can't be merged with lipo, so the app carries one per CPU.
@@ -74,6 +78,26 @@ if [[ ! -x "$XD/xdelta3" ]]; then
   rm -rf "$XD/download"
 fi
 
+# 7-Zip: both official macOS builds (Apple Silicon and Intel), checked against their SHA-256s, merged with lipo.
+SZ="vendor/7zz-$SEVENZIP_VERSION"
+if [[ ! -x "$SZ/7zz" ]]; then
+  echo "Downloading 7-Zip $SEVENZIP_VERSION…"
+  rm -rf "$SZ"; mkdir -p "$SZ/download/arm64" "$SZ/download/x86_64"
+  V=${SEVENZIP_VERSION//./}
+  for pair in "arm64:mac:$SEVENZIP_SHA256_ARM64" "x86_64:mac-x64:$SEVENZIP_SHA256_X86_64"; do
+    arch=${pair%%:*} rest=${pair#*:}; flavour=${rest%%:*} sha=${rest#*:}
+    txz="$SZ/download/7z$V-$flavour.tar.xz"
+    curl -fsSL -o "$txz" "https://github.com/ip7z/7zip/releases/download/$SEVENZIP_VERSION/7z$V-$flavour.tar.xz"
+    [[ "$(shasum -a 256 "$txz" | cut -d' ' -f1)" == "$sha" ]] || { echo "7-Zip ($arch) doesn't match the expected SHA-256"; rm -rf "$SZ"; exit 1; }
+    tar -xf "$txz" -C "$SZ/download/$arch"
+  done
+  lipo -create "$SZ/download/arm64/7zz" "$SZ/download/x86_64/7zz" -output "$SZ/7zz"
+  cp "$SZ/download/arm64/License.txt" "$SZ/License.txt"
+  printf '7-Zip %s by Igor Pavlov (https://www.7-zip.org), the official macOS builds for Apple Silicon and Intel\nfrom https://github.com/ip7z/7zip/releases/tag/%s, unmodified, combined with lipo. The source code is\navailable from https://www.7-zip.org and https://github.com/ip7z/7zip. Licenses: see License.txt.\n' \
+    "$SEVENZIP_VERSION" "$SEVENZIP_VERSION" > "$SZ/SOURCE.txt"
+  rm -rf "$SZ/download"
+fi
+
 # dolphin-tool: download the universal build once into vendor/, and check it's exactly the one published.
 DT="vendor/dolphin-tool-$DOLPHIN_VERSION"
 if [[ ! -x "$DT/dolphin-tool" ]]; then
@@ -110,6 +134,7 @@ cp LICENSE "$APP/Contents/Resources/LICENSE"
 ditto "vendor/chdman-$CHDMAN_VERSION" "$APP/Contents/Resources/chdman"
 ditto "$XD" "$APP/Contents/Resources/xdelta3"
 ditto "$DT" "$APP/Contents/Resources/dolphin-tool"
+ditto "$SZ" "$APP/Contents/Resources/7zz"
 
 # App icon: compile the Icon Composer icon (light + dark variants, made by make_icon.swift).
 # actool writes Assets.car (used by macOS for appearance-aware icons) and AppIcon.icns (fallback).
@@ -142,7 +167,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>
-      <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string><string>gcm</string><string>wbfs</string><string>ciso</string><string>gcz</string><string>wia</string><string>rvz</string></array>
+      <array><string>pbp</string><string>cue</string><string>bin</string><string>gdi</string><string>iso</string><string>chd</string><string>zip</string><string>7z</string><string>rar</string><string>ecm</string><string>gcm</string><string>wbfs</string><string>ciso</string><string>gcz</string><string>wia</string><string>rvz</string></array>
     </dict>
   </array>
   <key>NSAppTransportSecurity</key>
@@ -175,7 +200,7 @@ if [[ -n "${SIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --options runtime \
       --entitlements psxpackager.entitlements --sign "$SIGN_IDENTITY" "$bin"
   done
-  for tool in chdman xdelta3 dolphin-tool; do
+  for tool in chdman xdelta3 dolphin-tool 7zz; do
     codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP/Contents/Resources/$tool/$tool"
   done
   codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP"

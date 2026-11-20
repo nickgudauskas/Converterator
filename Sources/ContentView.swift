@@ -433,8 +433,8 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
-        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "chd", "zip", "7z", "gcm", "wbfs", "ciso", "gcz", "wia", "rvz", "xdelta", "vcdiff", "ppf", "bps", "ips"].compactMap { UTType(filenameExtension: $0) } + [.folder]
-        panel.message = "Choose .pbp, .cue, .gdi, .iso, .zip or .7z files or folders to compress, or .chd files to extract"
+        panel.allowedContentTypes = ["pbp", "cue", "gdi", "iso", "bin", "ecm", "chd", "zip", "7z", "rar", "gcm", "wbfs", "ciso", "gcz", "wia", "rvz", "xdelta", "vcdiff", "ppf", "bps", "ips"].compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.message = "Choose .pbp, .cue, .gdi, .iso, .ecm, .zip, .7z or .rar files or folders to compress, or .chd files to extract"
         present(panel) { c.add(panel.urls) }
     }
 

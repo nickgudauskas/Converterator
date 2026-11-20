@@ -150,6 +150,9 @@ final class Cleanup: ObservableObject {
             .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
         for f in files {
             let ext = f.pathExtension.lowercased()
+            // Part 2, 3… of a multi-part archive go with part 1; an ECM track listed by a .cue goes with the .cue.
+            if Converter.archiveExtensions.contains(ext) && Converter.isLaterPart(f) { continue }
+            if ext == "ecm" && ECM.sheet(for: f) != nil { continue }
             let dirs = [f.deletingLastPathComponent()] + (outputDir.map { [$0] } ?? [])
             var chds: [URL]?
             var trash: [URL] = [f]
@@ -157,19 +160,26 @@ final class Cleanup: ObservableObject {
             let recorded = (log[f.standardizedFileURL.path] ?? []).map { URL(fileURLWithPath: $0) }
             if !recorded.isEmpty && recorded.allSatisfy({ totalSize([$0]) > 0 }) {
                 chds = recorded
-                if Converter.inputExtensions.contains(ext) { trash = Converter.sourceFiles(for: f) }
+                trash = Converter.sourceFiles(for: f)
+            } else if ext == "ecm" {
+                chds = covering(base: ECM.gameName(f), isPBP: false, in: dirs)
             } else if Converter.inputExtensions.contains(ext) {
                 chds = covering(base: f.deletingPathExtension().lastPathComponent, isPBP: ext == "pbp", in: dirs)
                 trash = Converter.sourceFiles(for: f)
             } else if Converter.archiveExtensions.contains(ext) {
                 let names = ext == "zip" ? Converter.zipEntryNames(f) : sevenZip.flatMap { sevenZipNames(f, tool: $0) }
-                let games = (names ?? []).filter { Converter.inputExtensions.contains(($0 as NSString).pathExtension.lowercased()) }
+                func extOf(_ n: String) -> String { (n as NSString).pathExtension.lowercased() }
+                // The disc images inside; ECM-compressed tracks count only when there's no .cue/.gdi for them.
+                let sheets = (names ?? []).filter { Converter.inputExtensions.contains(extOf($0)) }
+                let games = sheets.isEmpty ? (names ?? []).filter { extOf($0) == "ecm" } : sheets
                 if games.isEmpty { continue }   // not a disc archive (e.g. zipped cartridge games)
+                trash = Converter.sourceFiles(for: f)   // (every part of a multi-part archive)
                 do {
                     var all: [URL] = []
                     for g in games {
                         let name = (g as NSString).lastPathComponent
-                        guard let c = covering(base: (name as NSString).deletingPathExtension,
+                        let base = extOf(name) == "ecm" ? ECM.gameName(URL(fileURLWithPath: name)) : (name as NSString).deletingPathExtension
+                        guard let c = covering(base: base,
                                                isPBP: (name as NSString).pathExtension.lowercased() == "pbp", in: dirs)
                         else { all = []; break }
                         all += c
@@ -179,7 +189,7 @@ final class Cleanup: ObservableObject {
             }
             if let chds, !chds.isEmpty {
                 result.append(Item(source: f, files: trash, bytes: totalSize(trash), chds: chds))
-            } else if Converter.inputExtensions.contains(ext) || Converter.archiveExtensions.contains(ext) {
+            } else if Converter.inputExtensions.contains(ext) || Converter.archiveExtensions.contains(ext) || ext == "ecm" {
                 unconverted.append(f)
             }
         }
@@ -211,17 +221,9 @@ final class Cleanup: ObservableObject {
         return nil
     }
 
-    /// File names inside a .7z, from `7zz l`.
+    /// File names inside a .7z or .rar, from `7zz l`.
     nonisolated static func sevenZipNames(_ url: URL, tool: URL) -> [String]? {
-        let p = Process()
-        p.executableURL = tool
-        p.arguments = ["l", "-ba", "-slt", url.path]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return nil }
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
-        return out.split(separator: "\n").filter { $0.hasPrefix("Path = ") }.map { String($0.dropFirst(7)) }
+        Converter.sevenZipEntries(url, tool: tool)?.map(\.name)
     }
 
     /// Runs `chdman verify`, reporting progress; stops it if it makes no progress for the stall timeout.

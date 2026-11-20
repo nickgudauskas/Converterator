@@ -97,7 +97,7 @@ final class Converter: ObservableObject {
     // MARK: Tools
 
     /// CPU architecture of the running app slice, matching the bundled tool suffixes.
-    static let arch: String = {
+    nonisolated static let arch: String = {
         #if arch(arm64)
         return "arm64"
         #else
@@ -105,7 +105,7 @@ final class Converter: ObservableObject {
         #endif
     }()
 
-    static func findTool(_ name: String) -> URL? {
+    nonisolated static func findTool(_ name: String) -> URL? {
         var candidates: [String] = []
         // The tests point this at the tools build.sh downloaded into vendor/.
         if let dirs = ProcessInfo.processInfo.environment["CONVERTERATOR_TOOLS_DIRS"] {
@@ -149,9 +149,16 @@ final class Converter: ObservableObject {
             let ext = f.pathExtension.lowercased()
             if PatchFormat.of(f) != nil || Patcher.isPatchZip(f) {
                 droppedPatches.append(f)
+            } else if Converter.archiveExtensions.contains(ext) && Converter.isLaterPart(f) {
+                // Part 2, 3… of a multi-part archive: the first part opens them all.
+                if let first = Converter.firstPart(of: f) { found.append(first) }
+                else { append("Skipped \(f.lastPathComponent): the archive's first part isn't next to it.") }
             } else if Converter.inputExtensions.contains(ext) || Converter.extractExtensions.contains(ext)
                 || Converter.archiveExtensions.contains(ext) {
                 found.append(f)
+            } else if ext == "ecm" {
+                // An ECM-compressed track goes through the .cue that lists it, if there is one.
+                found.append(ECM.sheet(for: f) ?? f)
             } else if ext == "bin" {
                 // A dropped .bin means its .cue sheet (same name); folder scans pick up the .cue directly.
                 let cue = f.deletingPathExtension().appendingPathExtension("cue")
@@ -168,8 +175,10 @@ final class Converter: ObservableObject {
                     let ext = f.pathExtension.lowercased()
                     if Converter.inputExtensions.contains(ext) || (ext == "chd" && outputFormat == .pbp) {
                         found.append(f)   // (CHDs too when making PBPs: they're the games then)
-                    } else if Converter.archiveExtensions.contains(ext), archiveHasDiscImage(f) {
+                    } else if Converter.archiveExtensions.contains(ext), !Converter.isLaterPart(f), archiveHasDiscImage(f) {
                         found.append(f)   // only archives with a disc image inside, not zipped cartridge games
+                    } else if ext == "ecm", ECM.sheet(for: f) == nil {
+                        found.append(f)   // a lone Game.bin.ecm (with a .cue, the .cue is found instead)
                     }
                 }
             } else {
@@ -177,8 +186,9 @@ final class Converter: ObservableObject {
             }
         }
         let existing = Set(jobs.map { $0.url.standardizedFileURL })
+        var seen = Set<URL>()
         let new = found.map { $0.standardizedFileURL }
-            .filter { !existing.contains($0) }
+            .filter { !existing.contains($0) && seen.insert($0).inserted }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         let newJobs = new.map { url -> Job in
             var job = Job(url: url)
@@ -204,7 +214,7 @@ final class Converter: ObservableObject {
         PatchLibrary.shared.lookUp(newJobs.filter { $0.patch == nil && !$0.isCHD && $0.state == .queued }.map { ($0.id, $0.url) })
         // Files added mid-run join the current batch.
         if isRunning || isPaused { batchIDs += newJobs.filter { $0.state == .queued }.map(\.id) }
-        if found.isEmpty && droppedPatches.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso, .chd, .zip or .7z files found in what was added.") }
+        if found.isEmpty && droppedPatches.isEmpty && !urls.isEmpty { append("No .pbp, .cue, .gdi, .iso, .ecm, .chd, .zip, .7z or .rar files found in what was added.") }
     }
 
     /// Sets or clears the patch for a file in the list (not while it's converting).
@@ -572,6 +582,18 @@ final class Converter: ObservableObject {
             update(id) { $0.fraction = 0.1 }
         }
 
+        // ECM-compressed tracks are expanded to their original .bin first (into a temporary folder).
+        let expanded = fm.temporaryDirectory.appendingPathComponent("converterator-ecm-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: expanded) }
+        var usedECM = false
+        for (i, g) in games.enumerated() where Converter.needsECM(g) {
+            switch await expandECM(g, into: expanded.appendingPathComponent("\(i)"), id: id) {
+            case .success(let disc): games[i] = disc; usedECM = true
+            case .failure(let e): return fail(e.message)
+            }
+            if cancelRequested { return fail("Cancelled") }
+        }
+
         var total = GameResult()
         for (i, game) in games.enumerated() {
             let w = (span.end - span.start) / Double(games.count)
@@ -588,7 +610,8 @@ final class Converter: ObservableObject {
         }
         // For an archive, "saved" compares the CHDs with the archive itself, which is what you had on disk.
         // (Likewise a patched CHD is compared with the CHD it came from.)
-        if (isArchive || isCHDSource) && total.bytesOut > 0 { total.bytesIn = totalSize([src]) }
+        // (And an ECM-compressed game with the .ecm files.)
+        if (isArchive || isCHDSource || usedECM) && total.bytesOut > 0 { total.bytesIn = totalSize(Converter.sourceFiles(for: src)) }
 
         let made = total.made
         var summary = made.count == 1 ? made[0].lastPathComponent : "\(made.count) CHDs"
@@ -617,8 +640,8 @@ final class Converter: ObservableObject {
                 summary += " · originals kept"
             } else {
                 var trashed = 0
-                // An archive goes to the Trash as a whole; its unpacked copy is temporary anyway.
-                for f in isArchive ? [src] : Converter.sourceFiles(for: src) {
+                // An archive goes to the Trash as a whole (every part of it); its unpacked copy is temporary anyway.
+                for f in Converter.sourceFiles(for: src) {
                     do { try fm.trashItem(at: f, resultingItemURL: nil); trashed += 1 }
                     catch { append("  couldn't move \(f.lastPathComponent) to Trash: \(error.localizedDescription)") }
                 }
@@ -635,7 +658,7 @@ final class Converter: ObservableObject {
 
         // If every CHD already existed (and wasn't verified), this job took no real time:
         // keep it out of the speed estimate.
-        let didWork = made.count > 0 && (made.count != total.skipped || verify || isArchive)
+        let didWork = made.count > 0 && (made.count != total.skipped || verify || isArchive || usedECM)
         update(id) {
             $0.state = .done; $0.detail = summary; $0.progress = nil; $0.timed = didWork
             $0.bytesIn = total.bytesIn; $0.bytesOut = total.bytesOut
@@ -881,12 +904,16 @@ final class Converter: ObservableObject {
 
     // MARK: Archives
 
-    nonisolated static let archiveExtensions: Set<String> = ["zip", "7z"]
+    nonisolated static let archiveExtensions: Set<String> = ["zip", "7z", "rar"]
+    /// What counts as a disc image inside an archive.
+    nonisolated static let discInArchiveExtensions: Set<String> = inputExtensions.union(["ecm"])
 
-    /// 7-Zip's command-line tool, from Homebrew's sevenzip (7zz) or p7zip (7z).
-    var sevenZip: URL? { Converter.findTool("7zz") ?? Converter.findTool("7z") }
+    /// 7-Zip's command-line tool (7zz), bundled in the app; Homebrew's as a fallback.
+    var sevenZip: URL? { Converter.sevenZipTool }
+    nonisolated static var sevenZipTool: URL? { findTool("7zz") ?? findTool("7z") }
 
-    /// Unpacks a .zip (with macOS's own ditto) or .7z (with 7-Zip). Returns an error message, or nil.
+    /// Unpacks a .zip (with macOS's own ditto), or a .7z or .rar (with 7-Zip, which opens the other parts of
+    /// a multi-part archive by itself). Returns an error message, or nil.
     func unpackArchive(_ src: URL, to dir: URL) async -> String? {
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         catch { return "Can't create temporary folder: \(error.localizedDescription)" }
@@ -894,13 +921,65 @@ final class Converter: ObservableObject {
         if src.pathExtension.lowercased() == "zip" {
             exe = URL(fileURLWithPath: "/usr/bin/ditto"); args = ["-x", "-k", src.path, dir.path]
         } else {
-            guard let sz = sevenZip else {
-                return ".7z files need 7-Zip. Install it in Terminal with:  brew install sevenzip"
-            }
-            exe = sz; args = ["x", "-y", "-bd", "-o" + dir.path, src.path]
+            guard let sz = sevenZip else { return "7-Zip is missing from the app, so .7z and .rar files can't be unpacked" }
+            exe = sz; args = ["x", "-y", "-bd", "-p-", "-o" + dir.path, src.path]   // (-p-: never wait for a password)
         }
-        let status = await run(exe, args) { [weak self] line in self?.append("  [\(exe.lastPathComponent)] \(line)") }
-        return status == 0 ? nil : "Couldn't unpack the archive (exit \(status)) — see log"
+        var said: [String] = []
+        let status = await run(exe, args) { [weak self] line in
+            said.append(line)
+            self?.append("  [\(exe.lastPathComponent)] \(line)")
+        }
+        if status == 0 { return nil }
+        let text = said.joined(separator: "\n").lowercased()
+        if text.contains("password") || text.contains("encrypted") { return "The archive is password-protected" }
+        if text.contains("missing volume") || text.contains("unexpected end") || text.contains("can not open the file as") && Converter.isMultiPart(src) {
+            return "A part of the archive is missing or incomplete"
+        }
+        return "Couldn't unpack the archive (exit \(status)) — see log"
+    }
+
+    // MARK: Multi-part archives
+
+    /// "Game.part2.rar" → ("Game", 2, 1 digit); nil for other names.
+    nonisolated static func partNumber(_ url: URL) -> (base: String, number: Int, digits: Int)? {
+        let name = url.lastPathComponent
+        guard let r = name.range(of: #"\.part([0-9]+)\.rar$"#, options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let digits = name[r].dropFirst(5).dropLast(4)
+        guard let n = Int(digits) else { return nil }
+        return (String(name[..<r.lowerBound]), n, digits.count)
+    }
+
+    nonisolated static func isMultiPart(_ url: URL) -> Bool { archiveParts(url).count > 1 }
+
+    /// Part 2, 3… of a "Game.partN.rar" set.
+    nonisolated static func isLaterPart(_ url: URL) -> Bool { (partNumber(url)?.number ?? 1) > 1 }
+
+    /// The first part of the set a later part belongs to, if it's there.
+    nonisolated static func firstPart(of url: URL) -> URL? {
+        guard let p = partNumber(url) else { return url }
+        return archiveParts(url).first { partNumber($0)?.number == 1 }
+            ?? (FileManager.default.fileExists(atPath: url.path) && p.number == 1 ? url : nil)
+    }
+
+    /// Every file of a multi-part archive: Game.part1.rar, Game.part2.rar…, or Game.rar with Game.r00,
+    /// Game.r01…. Just the archive for anything else.
+    nonisolated static func archiveParts(_ url: URL) -> [URL] {
+        let dir = url.deletingLastPathComponent()
+        let ext = url.pathExtension.lowercased()
+        guard ext == "rar" else { return [url] }
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        var parts: [URL]
+        if let p = partNumber(url) {
+            parts = files.filter { partNumber($0).map { $0.base == p.base } ?? false }
+                .sorted { (partNumber($0)?.number ?? 0) < (partNumber($1)?.number ?? 0) }
+        } else {
+            let base = url.deletingPathExtension().lastPathComponent
+            parts = [url] + files.filter {
+                $0.deletingPathExtension().lastPathComponent == base
+                    && $0.pathExtension.range(of: #"^[rRsS][0-9]{2}$"#, options: .regularExpression) != nil
+            }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        }
+        return parts.isEmpty ? [url] : parts.map(\.standardizedFileURL)
     }
 
     /// Disc images in an unpacked archive, the way a folder scan finds them. A .bin with its own
@@ -908,7 +987,12 @@ final class Converter: ObservableObject {
     nonisolated static func gamesInFolder(_ dir: URL) -> [URL] {
         (FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])?
             .allObjects as? [URL] ?? [])
-            .filter { inputExtensions.contains($0.pathExtension.lowercased()) && !$0.path.contains("/__MACOSX/") }
+            .filter { !$0.path.contains("/__MACOSX/") }
+            .filter { f in
+                let ext = f.pathExtension.lowercased()
+                // (A Game.bin.ecm is reached through its .cue, when it has one.)
+                return inputExtensions.contains(ext) || (ext == "ecm" && ECM.sheet(for: f) == nil)
+            }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
     }
 
@@ -959,10 +1043,22 @@ final class Converter: ObservableObject {
             let unpacked = entries.allSatisfy({ $0.size != nil }) && !entries.isEmpty
                 ? entries.reduce(0) { $0 + ($1.size ?? 0) } : size * 4
             return (unpacked, unpacked)
-        case "7z": return (size * 4, size * 4)
+        case "7z", "rar":
+            let entries = sevenZipTool.flatMap { sevenZipEntries(src, tool: $0) } ?? []
+            let unpacked = entries.allSatisfy({ $0.size != nil }) && !entries.isEmpty
+                ? entries.reduce(0) { $0 + ($1.size ?? 0) } : size * 4
+            return (unpacked, unpacked)
+        // ECM: expanded to a .bin a little bigger than the .ecm (temporary), then compressed.
+        case "ecm": return (size * 1.2, size * 1.2)
         // Extracting: known once chdman has read it. Patching: unpacked (about 2–3× the CHD), then compressed again.
         case "chd": return patched ? (size * 1.5, size * 3) : (0, 0)
-        default: return (size, 0)
+        default:
+            let ecm = ecmTracks(for: src)
+            if !ecm.isEmpty {
+                let dir = src.deletingLastPathComponent()
+                return (size * 1.2, totalSize(ecm.map { dir.appendingPathComponent($0 + ".ecm") }) * 1.2)
+            }
+            return (size, 0)
         }
     }
 
@@ -995,22 +1091,40 @@ final class Converter: ObservableObject {
     /// Whether a folder scan should pick up this archive: only if it has a disc image inside, so a folder
     /// of zipped cartridge games doesn't fill the list. .7z needs 7-Zip to look inside.
     func archiveHasDiscImage(_ url: URL) -> Bool {
-        let wanted = Converter.inputExtensions
+        let wanted = Converter.discInArchiveExtensions
         if url.pathExtension.lowercased() == "zip" {
             guard let names = Converter.zipEntryNames(url) else { return true }   // can't tell: let the job decide
             return names.contains { wanted.contains(($0 as NSString).pathExtension.lowercased()) }
         }
         guard let sz = sevenZip else { return false }
+        guard let entries = Converter.sevenZipEntries(url, tool: sz) else { return true }   // e.g. encrypted names: let the job say
+        return entries.contains { wanted.contains(($0.name as NSString).pathExtension.lowercased()) }
+    }
+
+    /// File names and unpacked sizes inside a .7z or .rar, from `7zz l`. Nil if 7-Zip can't list it.
+    nonisolated static func sevenZipEntries(_ url: URL, tool: URL) -> [(name: String, size: Double?)]? {
         let p = Process()
-        p.executableURL = sz
-        p.arguments = ["l", "-ba", "-slt", url.path]
+        p.executableURL = tool
+        // -p-: never stop to ask for a password (an archive with encrypted names just fails to list).
+        p.arguments = ["l", "-ba", "-slt", "-p-", url.path]
+        p.standardInput = FileHandle.nullDevice
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return false }
+        guard (try? p.run()) != nil else { return nil }
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         p.waitUntilExit()
-        return out.split(separator: "\n").contains { line in
-            line.hasPrefix("Path = ") && wanted.contains((String(line.dropFirst(7)) as NSString).pathExtension.lowercased())
+        guard p.terminationStatus == 0 else { return nil }
+        var entries: [(name: String, size: Double?)] = []
+        var isFolder = false
+        for line in out.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("Path = ") {
+                entries.append((String(line.dropFirst(7)), nil)); isFolder = false
+            } else if line.hasPrefix("Folder = +") {
+                isFolder = true
+            } else if line.hasPrefix("Size = "), !isFolder, !entries.isEmpty {
+                entries[entries.count - 1].size = Double(line.dropFirst(7).trimmingCharacters(in: .whitespaces))
+            }
         }
+        return entries
     }
 
     // MARK: Track files
@@ -1018,7 +1132,16 @@ final class Converter: ObservableObject {
     /// Track files a .cue or .gdi lists that aren't next to it. Empty for other files.
     nonisolated static func missingTracks(for src: URL) -> [String] {
         let dir = src.deletingLastPathComponent()
-        return trackNames(in: src).filter { !FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path) }
+        let fm = FileManager.default
+        return trackNames(in: src).filter {
+            !fm.fileExists(atPath: dir.appendingPathComponent($0).path)
+                && !fm.fileExists(atPath: dir.appendingPathComponent($0 + ".ecm").path)   // ECM-compressed: expanded when converting
+        }
+    }
+
+    /// A game's name from its file: "Game.cue" → "Game", "Game.bin.ecm" → "Game".
+    nonisolated static func gameName(_ url: URL) -> String {
+        url.pathExtension.lowercased() == "ecm" ? ECM.gameName(url) : url.deletingPathExtension().lastPathComponent
     }
 
     nonisolated static func describeMissing(_ names: [String]) -> String {
@@ -1310,11 +1433,15 @@ final class Converter: ObservableObject {
     /// The input file plus any track files it references (for .cue and .gdi), limited to files that
     /// exist inside the input's own folder.
     nonisolated static func sourceFiles(for src: URL) -> [URL] {
+        if archiveExtensions.contains(src.pathExtension.lowercased()) { return archiveParts(src) }
         let dir = src.deletingLastPathComponent().standardizedFileURL
         var result = [src]
         var seen: Set<String> = [src.standardizedFileURL.path]
         for name in trackNames(in: src) {
-            let f = dir.appendingPathComponent(name).standardizedFileURL
+            var f = dir.appendingPathComponent(name).standardizedFileURL
+            // A track kept ECM-compressed: Game.bin.ecm instead of Game.bin.
+            let ecm = f.appendingPathExtension("ecm")
+            if !FileManager.default.fileExists(atPath: f.path), FileManager.default.fileExists(atPath: ecm.path) { f = ecm }
             guard f.path.hasPrefix(dir.path + "/"),
                   FileManager.default.fileExists(atPath: f.path),
                   seen.insert(f.path).inserted else { continue }

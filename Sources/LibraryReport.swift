@@ -85,10 +85,10 @@ struct LibraryReport: Sendable {
 
         status("Looking for missing discs and playlists…")
         // Disc sets per folder, counting both CHDs and not-yet-converted disc images.
-        let discFiles = r.chds + unconverted.filter { Converter.inputExtensions.contains($0.pathExtension.lowercased()) }
+        let discFiles = r.chds + unconverted.filter { ["ecm"].contains($0.pathExtension.lowercased()) || Converter.inputExtensions.contains($0.pathExtension.lowercased()) }
         var sets: [String: (dir: URL, name: String, discs: Set<Int>, of: Int?)] = [:]
         for f in discFiles {
-            guard let d = DiscName.parse(f.deletingPathExtension().lastPathComponent) else { continue }
+            guard let d = DiscName.parse(Converter.gameName(f)) else { continue }
             let dir = f.deletingLastPathComponent()
             let k = dir.path + "\u{0}" + d.key
             var e = sets[k] ?? (dir, d.key, [], nil)

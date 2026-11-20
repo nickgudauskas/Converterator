@@ -17,6 +17,7 @@ command -v chdman >/dev/null || { echo "chdman not found: brew install rom-tools
 XDELTA=$(ls -d "$PWD"/vendor/xdelta3-*/ | head -1); XDELTA=${XDELTA%/}
 PSX="$PWD/vendor/$([[ "$(uname -m)" == arm64 ]] && echo osx-arm64 || echo osx-x64)"
 DOLPHIN=$(ls -d "$PWD"/vendor/dolphin-tool-*/ | head -1); DOLPHIN=${DOLPHIN%/}
+SEVENZ=$(ls -d "$PWD"/vendor/7zz-*/ | head -1); SEVENZ=${SEVENZ%/}
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/converterator-tests.XXXXXX")
 # The test program keeps its settings under its own name; remove them afterwards.
@@ -88,6 +89,23 @@ cp "$F/plain.iso" "$F/zip/stage/two/alpha.iso"; cp "$F/ps1.iso" "$F/zip/stage/tw
 (cd "$F/zip/stage/one" && zip -qr "$F/zip/one.zip" "Game One")
 (cd "$F/zip/stage/two" && zip -qr "$F/zip/two.zip" alpha.iso beta.iso)
 echo cart > "$F/zip/stage/rom.sfc"; (cd "$F/zip/stage" && zip -q "$F/zip/snes.zip" rom.sfc)
+# .7z (made with the bundled 7-Zip) and .rar: one game in a subfolder, and one split over three parts
+(cd "$F/zip/stage/two" && "$SEVENZ/7zz" a -bd -bso0 "$F/zip/seven.7z" alpha.iso >/dev/null)
+mkdir -p "$F/rar"
+python3 -I tests/make_rar.py "$F/rar/one.rar" "$F/cd/game.cue=Game One/game.cue" "$F/cd/game.bin=Game One/game.bin"
+python3 -I tests/make_rar.py --volumes 3 "$F/rar/Split Game" "$F/two/Two.cue=Two.cue" \
+  "$F/two/Two (Track 1).bin=Two (Track 1).bin" "$F/two/Two (Track 2).bin=Two (Track 2).bin"
+
+# ECM: a disc mixing Mode 1, Mode 2 Form 1 and Form 2 sectors (with correct EDC/ECC), damaged sectors and
+# plain data, ECM-compressed: with its .cue, on its own, in a zip, and a damaged copy
+mkdir -p "$F/ecm/lone" "$F/ecm/zip"
+python3 -I tests/make_ecm.py sample "$F/ecm/ECM Game.bin"
+python3 -I tests/make_ecm.py encode "$F/ecm/ECM Game.bin" "$F/ecm/ECM Game.bin.ecm"
+printf 'FILE "ECM Game.bin" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n' > "$F/ecm/ECM Game.cue"
+cp "$F/ecm/ECM Game.bin.ecm" "$F/ecm/lone/Lone Game.bin.ecm"
+(cd "$F/ecm" && zip -q "$F/ecm/zip/zipped.zip" "ECM Game.cue" "ECM Game.bin.ecm")
+python3 -I -c 'import sys; d = bytearray(open(sys.argv[1], "rb").read()); d[len(d) // 2] ^= 0x40; open(sys.argv[2], "wb").write(d)' \
+  "$F/ecm/ECM Game.bin.ecm" "$F/ecm/damaged.bin.ecm"
 
 # Patches: a one-track game changed in two places (outside PPF's check block at 0x9320), made into
 # xdelta, IPS, BPS and PPF patches. Plus a two-track game whose patch changes only track 2.
@@ -208,4 +226,4 @@ if ! swiftc -parse-as-library -swift-version 5 $(ls Sources/*.swift | grep -v '/
 fi
 
 echo "Running…"
-CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX:$DOLPHIN" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"
+CONVERTERATOR_DATA_DIR="$W/data" CONVERTERATOR_TOOLS_DIRS="$XDELTA:$PSX:$DOLPHIN:$SEVENZ" "$W/converterator-tests" "$F" "$W/work" "${1:-}" "$PWD"

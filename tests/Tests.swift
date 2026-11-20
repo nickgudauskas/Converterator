@@ -125,6 +125,92 @@ func job(_ jobs: [Job], _ suffix: String) -> Job? { jobs.first { $0.url.path.has
         let leftovers = tempFolders().subtracting(tempBefore)
         check(leftovers.isEmpty, "temporary files cleaned up", "\(leftovers.sorted())")
 
+        // MARK: 7z and RAR (bundled 7-Zip)
+        section("7z and RAR")
+        let rw = workspace("rar", from: F, ["rar/one.rar", "rar/Split Game.part1.rar", "rar/Split Game.part2.rar",
+                                            "rar/Split Game.part3.rar", "zip/seven.7z"], into: W)
+        let part1 = rw.appendingPathComponent("Split Game.part1.rar")
+        check(c.sevenZip?.path.contains("/vendor/7zz-") == true, "uses the bundled 7-Zip", c.sevenZip?.path ?? "none")
+        c.clearAll(); c.add([rw])
+        let rarFound = c.jobs.map(\.url.lastPathComponent).sorted()
+        check(rarFound == ["Split Game.part1.rar", "one.rar", "seven.7z"], "folder scan: .rar, .7z, and only part 1 of a split archive", "\(rarFound)")
+        c.clearAll(); c.add([rw.appendingPathComponent("Split Game.part3.rar")])
+        check(c.jobs.map(\.url.lastPathComponent) == ["Split Game.part1.rar"], "a dropped later part adds part 1")
+        c.clearAll(); c.add([part1, rw.appendingPathComponent("Split Game.part2.rar")])
+        check(c.jobs.count == 1, "dropping every part adds the archive once", "\(c.jobs.map(\.url.lastPathComponent))")
+        check(Converter.sourceFiles(for: part1).map(\.lastPathComponent)
+              == ["Split Game.part1.rar", "Split Game.part2.rar", "Split Game.part3.rar"], "all three parts belong to the archive")
+        let gameSize = totalSize([F.appendingPathComponent("cd/game.cue"), F.appendingPathComponent("cd/game.bin")])
+        check(Converter.spaceNeeded(for: rw.appendingPathComponent("one.rar")).temp == gameSize, "unpacked size read from the .rar",
+              "\(Converter.spaceNeeded(for: rw.appendingPathComponent("one.rar")).temp) vs \(gameSize)")
+        let tempBeforeRar = tempFolders()
+        jobs = await runBatch([rw])
+        check(job(jobs, "one.rar")?.state == .done && exists(rw.appendingPathComponent("game.chd")), "RAR with a game in a subfolder", job(jobs, "one.rar")?.detail ?? "")
+        check(job(jobs, "Split Game.part1.rar")?.state == .done && exists(rw.appendingPathComponent("Two.chd")), "RAR split over three parts",
+              job(jobs, "Split Game.part1.rar")?.detail ?? "")
+        check(job(jobs, "seven.7z")?.state == .done && exists(rw.appendingPathComponent("alpha.chd")), "7z", job(jobs, "seven.7z")?.detail ?? "")
+        let rarScan = Cleanup.scanSources(in: rw, outputDir: nil, sevenZip: c.sevenZip)
+        let splitItem = rarScan.converted.first { $0.source.lastPathComponent == "Split Game.part1.rar" }
+        check(splitItem?.files.count == 3 && rarScan.converted.count == 3 && rarScan.unconverted.isEmpty,
+              "Clean Up Originals: a split archive is one original with all its parts",
+              "\(rarScan.converted.map { "\($0.source.lastPathComponent): \($0.files.count)" }) / \(rarScan.unconverted)")
+        check(tempFolders().subtracting(tempBeforeRar).isEmpty, "temporary files cleaned up")
+
+        // MARK: ECM
+        section("ECM")
+        let ecmBin = F.appendingPathComponent("ecm/ECM Game.bin"), ecmFile = F.appendingPathComponent("ecm/ECM Game.bin.ecm")
+        check(ECM.isECM(ecmFile) && !ECM.isECM(ecmBin), "recognised by its signature")
+        check(ECM.decodedName(ecmFile) == "ECM Game.bin" && ECM.gameName(ecmFile) == "ECM Game", "names: Game.bin.ecm → Game.bin → Game")
+        let decoded = W.appendingPathComponent("decoded.bin")
+        do {
+            try ECM.decode(ecmFile, to: decoded)
+            check(sha1(decoded) == sha1(ecmBin), "decodes to the original image (Mode 1, Mode 2 Form 1 and Form 2, damaged and plain sectors)")
+        } catch { check(false, "decodes to the original image", "\(error)") }
+        do {
+            try ECM.decode(F.appendingPathComponent("ecm/damaged.bin.ecm"), to: decoded)
+            check(false, "a damaged ECM file is refused")
+        } catch let e as ECM.DecodeError {
+            check(e.message.contains("damaged"), "a damaged ECM file is refused", e.message)
+        } catch { check(false, "a damaged ECM file is refused", "\(error)") }
+        let ew = workspace("ecm", from: F, ["ecm/ECM Game.cue", "ecm/ECM Game.bin.ecm"], into: W)
+        let lone = workspace("ecm-lone", from: F, ["ecm/lone/Lone Game.bin.ecm"], into: W)
+        let ez = workspace("ecm-zip", from: F, ["ecm/zip/zipped.zip"], into: W)
+        let ecmCue = ew.appendingPathComponent("ECM Game.cue")
+        check(Converter.missingTracks(for: ecmCue).isEmpty, "a track kept as .ecm isn't missing")
+        check(Converter.sourceFiles(for: ecmCue).map(\.lastPathComponent) == ["ECM Game.cue", "ECM Game.bin.ecm"], "the .ecm is one of the game's files")
+        check(Converter.spaceNeeded(for: ecmCue).temp > 0, "room is needed to expand it")
+        c.clearAll(); c.add([ew, lone, ez])
+        let ecmFound = c.jobs.map(\.url.lastPathComponent).sorted()
+        check(ecmFound == ["ECM Game.cue", "Lone Game.bin.ecm", "zipped.zip"], "folder scan: the .cue (not its .ecm), a lone .ecm, a zip with ECM inside", "\(ecmFound)")
+        c.clearAll(); c.add([ew.appendingPathComponent("ECM Game.bin.ecm")])
+        check(c.jobs.map(\.url.lastPathComponent) == ["ECM Game.cue"], "a dropped .ecm goes through its .cue")
+        let tempBeforeECM = tempFolders()
+        jobs = await runBatch([ecmCue, lone.appendingPathComponent("Lone Game.bin.ecm"), ez.appendingPathComponent("zipped.zip")])
+        @MainActor func discBin(_ chd: URL) async -> String? {
+            let out = W.appendingPathComponent("ecm-check-\(UUID().uuidString)")
+            defer { try? fm.removeItem(at: out) }
+            guard case .success(let disc) = await Converter.unpackCHD(chd, into: out, chdman: c.chdman!),
+                  let bin = Converter.sourceFiles(for: disc).dropFirst().first else { return nil }
+            return sha1(bin)
+        }
+        let original = sha1(ecmBin)
+        for (j, chd, what) in [("ECM Game.cue", ew.appendingPathComponent("ECM Game.chd"), ".cue with an .ecm track"),
+                               ("Lone Game.bin.ecm", lone.appendingPathComponent("Lone Game.chd"), "lone .bin.ecm (a .cue made for it)"),
+                               ("zipped.zip", ez.appendingPathComponent("ECM Game.chd"), "zip with a .cue and an .ecm inside")] {
+            let ok = job(jobs, j)?.state == .done
+            let same = ok ? await discBin(chd) == original : false
+            check(ok && same, "\(what) → CHD holding the original image", job(jobs, j)?.detail ?? "")
+        }
+        check(job(jobs, "ECM Game.cue")?.bytesIn == totalSize([ecmCue, ew.appendingPathComponent("ECM Game.bin.ecm")]),
+              "savings compare the CHD with the .ecm on disk")
+        check(tempFolders().subtracting(tempBeforeECM).isEmpty, "temporary files cleaned up")
+        let ecmScan = Cleanup.scanSources(in: ew, outputDir: nil, sevenZip: nil)
+        check(ecmScan.converted.map(\.source.lastPathComponent) == ["ECM Game.cue"] && ecmScan.converted.first?.files.count == 2,
+              "Clean Up Originals: the .cue and its .ecm", "\(ecmScan.converted.map(\.source.lastPathComponent))")
+        let loneScan = Cleanup.scanSources(in: lone, outputDir: nil, sevenZip: nil)
+        check(loneScan.converted.map(\.source.lastPathComponent) == ["Lone Game.bin.ecm"], "Clean Up Originals: a lone .ecm")
+        c.clearAll()
+
         // MARK: Playlists
         section("Playlists")
         let discs = W.appendingPathComponent("discs"); try? fm.createDirectory(at: discs, withIntermediateDirectories: true)

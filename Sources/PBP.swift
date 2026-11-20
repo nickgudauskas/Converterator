@@ -26,7 +26,7 @@ extension Converter {
 
         // The other discs of this game, if they're waiting too, go in the same PBP.
         var discs = [job]
-        if let d = DiscName.parse(src.deletingPathExtension().lastPathComponent) {
+        if let d = DiscName.parse(Converter.gameName(src)) {
             let dir = src.deletingLastPathComponent()
             let siblings = jobs.filter { j in
                 j.id != id && j.state == .queued && j.url.deletingLastPathComponent() == dir
@@ -60,14 +60,20 @@ extension Converter {
                 case .failure(let e): return failAll("\(d.url.lastPathComponent): \(e.message)")
                 }
                 if cancelRequested { return failAll("Cancelled") }
+            } else if Converter.needsECM(input) {
+                switch await expandECM(input, into: work.appendingPathComponent("disc\(n + 1)-ecm"), id: id) {
+                case .success(let disc): input = disc
+                case .failure(let e): return failAll("\(d.url.lastPathComponent): \(e.message)")
+                }
+                if cancelRequested { return failAll("Cancelled") }
             }
             inputs.append(input)
         }
 
         // Name: the game ("Game" for "Game (Disc 1)"), or the patched name ("Racing Lagoon (English)").
         var name = discs.count > 1
-            ? DiscName.parse(src.deletingPathExtension().lastPathComponent)?.key ?? src.deletingPathExtension().lastPathComponent
-            : src.deletingPathExtension().lastPathComponent
+            ? DiscName.parse(Converter.gameName(src))?.key ?? Converter.gameName(src)
+            : Converter.gameName(src)
         if let firstPatch, let patch = discs.first(where: { $0.patch != nil })?.patch {
             name = Patcher.patchedName(game: discs.count > 1 ? src.deletingLastPathComponent().appendingPathComponent(name + ".cue") : src,
                                        patch: firstPatch, alsoLookIn: patch.deletingPathExtension().lastPathComponent)
@@ -137,13 +143,19 @@ extension Converter {
             case .success(let d): disc = d
             case .failure(let e): return .failure(e)
             }
-        case "zip", "7z":
+        case "zip", "7z", "rar":
             if let err = await unpackArchive(job.url, to: work.appendingPathComponent("unpacked")) { return .failure(.init(message: err)) }
             guard let d = Converter.gamesInFolder(work.appendingPathComponent("unpacked")).first else {
                 return .failure(.init(message: "No disc image inside the archive"))
             }
             disc = d
         default: break
+        }
+        if Converter.needsECM(disc) {
+            switch await expandECM(disc, into: work.appendingPathComponent("ecm"), id: job.id) {
+            case .success(let d): disc = d
+            case .failure(let e): return .failure(e)
+            }
         }
         let xdelta = Converter.findTool("xdelta3")
         var first: URL?

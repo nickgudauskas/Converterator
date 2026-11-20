@@ -28,10 +28,10 @@ enum Patcher {
         if patchName.contains(" ") && patchName.contains(where: \.isUppercase) {
             return Converter.safeFileName(patchName)
         }
-        var title = redumpGame ?? game.deletingPathExtension().lastPathComponent
+        var title = redumpGame ?? Converter.gameName(game)
         if let r = title.range(of: #"\s*[\(\[]"#, options: .regularExpression) { title = String(title[..<r.lowerBound]) }
         title = title.trimmingCharacters(in: .whitespaces)
-        if title.isEmpty { title = game.deletingPathExtension().lastPathComponent }
+        if title.isEmpty { title = Converter.gameName(game) }
         // `other`: the zip a patch came in, whose name often says the language when the patch's doesn't.
         let what = tag(for: patchName) ?? other.flatMap { tag(for: $0) } ?? "Patched"
         return Converter.safeFileName("\(title) (\(what))")
@@ -69,7 +69,7 @@ enum Patcher {
 
     /// A patch next to `game` with the same name (Game.xdelta beside Game.cue), if there is one.
     nonisolated static func findPatch(for game: URL) -> URL? {
-        let base = game.deletingPathExtension()
+        let base = game.deletingLastPathComponent().appendingPathComponent(Converter.gameName(game))
         for ext in ["xdelta", "xdelta3", "vcdiff", "delta", "ppf", "bps", "ips"] {
             for variant in [ext, ext.uppercased()] {
                 let p = base.appendingPathExtension(variant)
@@ -461,7 +461,7 @@ final class PatchLibrary: ObservableObject {
 
     /// A game's title for matching: its name without region and other tags, as a key.
     nonisolated static func titleKey(_ game: URL) -> String {
-        var t = game.deletingPathExtension().lastPathComponent
+        var t = Converter.gameName(game)
         if let r = t.range(of: #"\s*[\(\[]"#, options: .regularExpression) { t = String(t[..<r.lowerBound]) }
         return key(t)
     }
