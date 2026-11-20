@@ -250,7 +250,9 @@ final class Converter: ObservableObject {
     /// game it was made for, found the way the patches folder finds them (BPS and PPF by checksum, xdelta
     /// and IPS by name), including games added later. One patch and one game: it goes to that game.
     @Published private(set) var addedPatches: [URL] = []
-    @Published private(set) var matchingPatches = false
+    /// Matches still running (patches and games can be added while one is), shown as "looking".
+    @Published private var matchesRunning = 0
+    var matchingPatches: Bool { matchesRunning > 0 }
 
     func addPatches(_ urls: [URL]) {
         let fm = FileManager.default
@@ -292,7 +294,8 @@ final class Converter: ObservableObject {
     func matchAddedPatches(to games: [(UUID, URL)]) {
         let patches = addedPatches
         guard !patches.isEmpty else { return }
-        matchingPatches = true
+        guard !games.isEmpty else { pairLonePatch(); return }
+        matchesRunning += 1
         let prefer = PatchLibrary.preferredLanguage
         Task.detached {
             let entries = PatchLibrary.index(files: patches)
@@ -309,15 +312,19 @@ final class Converter: ObservableObject {
                     self.setPatch(e.url, member: e.member, for: id)
                     self.append("Patch for \(j.url.lastPathComponent): \(e.member.map { "\(e.url.lastPathComponent) → \($0)" } ?? e.url.lastPathComponent)")
                 }
-                // One patch left over and one game without a patch: they go together.
-                let unused = self.addedPatches.filter { self.gamesPatched(by: $0).isEmpty }
-                let games = self.jobs.filter { !$0.isExtraction }
-                if unused.count == 1, games.count == 1, games[0].state == .queued, games[0].patch == nil {
-                    self.setPatch(unused[0], for: games[0].id)
-                    self.append("Patch for \(games[0].url.lastPathComponent): \(unused[0].lastPathComponent) (the only game in the list)")
-                }
-                self.matchingPatches = false
+                self.pairLonePatch()
+                self.matchesRunning -= 1
             }
+        }
+    }
+
+    /// One patch left over and one game without a patch: they go together.
+    private func pairLonePatch() {
+        let unused = addedPatches.filter { gamesPatched(by: $0).isEmpty }
+        let games = jobs.filter { !$0.isExtraction }
+        if unused.count == 1, games.count == 1, games[0].state == .queued, games[0].patch == nil {
+            setPatch(unused[0], for: games[0].id)
+            append("Patch for \(games[0].url.lastPathComponent): \(unused[0].lastPathComponent) (the only game in the list)")
         }
     }
 
